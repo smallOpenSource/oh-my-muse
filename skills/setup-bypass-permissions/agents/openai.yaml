@@ -1,0 +1,5 @@
+# Codex reads this beside SKILL.md. The skill turns off every tool confirmation in Claude Code, so Codex
+# may not pick it on its own: the person calls $banker-setup-bypass-permissions by name.
+# NOTE: Codex 런타임 전용 정책 파일. Muse 환경에서는 해당 없음.
+policy:
+  allow_implicit_invocation: false
