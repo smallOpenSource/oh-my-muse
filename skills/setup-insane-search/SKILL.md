@@ -5,6 +5,14 @@ description: "차단·봇방어 사이트 우회 검색·페치 플러그인 ins
 
 # setup-insane-search: insane-search 플러그인 설치
 
+## Muse 환경 적용 (2026-10-25 수정)
+
+- 이 Muse 환경에서는 Codex CLI 플러그인을 Muse 도구로 직접 불러올 수 없다. 플러그인 설치 성공을 Muse 검색 능력과 동일시하지 않는다.
+- 이 VM의 Codex CLI(codex-cli 0.164.0-alpha.9)에서 마켓플레이스 추가가 실패한다. 원본 저장소가 Codex 마켓플레이스 형식이 아니라 Claude 플러그인 형식이기 때문이다. 같은 명령을 반복해도 결과는 바뀌지 않는다.
+- Muse 환경에서의 기본 경로는 다음 순서다: browser.search, social.search, browser.open, 차단·봇방어 페이지에 한해 browser.browse 라이브 브라우저 작업. 라이브 브라우저에서 CAPTCHA가 나오면 사용자가 직접 푸는 것을 마지막 수단으로 안내한다.
+- 원본 Claude·Codex 설치 경로는 아래에 참고용으로 남긴다. Muse VM이 아닌, 해당 CLI가 있는 사용자 머신에서만 적용한다.
+- 검증 기준: 마켓플레이스 추가가 실패하면 설치 성공으로 보고하지 않는다. Muse 경로에서는 검색·열람 결과가 실제로 돌아왔는지로만 성공을 판단한다.
+
 ## Purpose
 
 차단 사이트 우회(WAF·봇방어; X·Reddit·YouTube·GitHub 등) 검색·페치를 제공하는 `insane-search` 플러그인을 설치한다. 현재 도구(Claude Code / Codex)를 감지해 알맞은 경로로 진행하고, 이미 설치돼 있으면 skip(멱등). 답변은 한글.
