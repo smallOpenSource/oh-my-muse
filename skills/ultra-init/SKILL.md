@@ -1,7 +1,7 @@
 ---
 name: ultra-init
 description: "아이디어·러프 브리프·그린필드를 계획→구현→ralph-qa QA 통과까지 핸즈오프 1회 자율 실행하는 풀사이클 오케스트레이터. 사용자가 'ultra-init', '알아서 만들어줘', '핸즈오프 빌드'라고 요청하면 사용."
-argument-hint: "[--short|--deliberate] [--gated] [--qa tests,build,lint,typecheck,scenarios] [--critic=architect|critic|codex] [--plan-id <id>] <브리프 / 만들 것>"
+argument-hint: "[--short|--deliberate] [--gated] [--qa tests,build,lint,typecheck,scenarios] [--critic=architect|critic] [--plan-id <id>] <브리프 / 만들 것>"
 ---
 
 # ultra-init: 자율 풀사이클 오케스트레이터

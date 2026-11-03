@@ -49,6 +49,7 @@ OMC 에이전트 프롬프트 카탈로그. `subagent.spawn` 위임 시 렌즈 �
 ### OMC 상태·팀·메모 (OMC 런타임 전용 MCP/슬래시)
 
 - **외부 AI/오케스트레이션**: `/team N:executor "task"`(worker type: executor, debugger, designer, codex, gemini, antigravity), `omc team N:codex|gemini "..."`, `omc ask <claude|codex|gemini|antigravity|grok|cursor>`. 멀티모델 합성(구 `/ccg`, 5.0.0에서 삭제): `/oh-my-claudecode:ask codex` + `/oh-my-claudecode:ask antigravity` 후 합성, 또는 `/team`.
+- **Muse 환경**: 위 외부 워커 유형(codex·gemini·antigravity)과 `omc ask <모델>` 라우팅은 이 환경에서 동작하지 않는다. 모든 역할은 Muse 기반 서브에이전트로 실행한다.
 - **OMC CLI (OMC 5)**: `omc ralph verify [--write-baseline] [--session <id>]` — ralph가 자체 실행하는 피드백 베이스라인·게이트. 전역 CLI가 플러그인과 맞아야 한다(4.x CLI엔 없어 ralph가 멈춘다). `omc ultragoal create-goals|complete-goals|checkpoint|record-review-blockers|status` — `.omc/ultragoal/` 아래 내구 목표 원장.
 - **OMC state**: `state_read`, `state_write`, `state_clear`, `state_list_active`, `state_get_status`, `state_migrate_non_git`
 - **Wiki·공유 메모리·트레이스**: `wiki_ingest`, `wiki_query`, `wiki_list`, `wiki_read`, `wiki_lint`, `wiki_add`, `wiki_delete` · `shared_memory_read`, `shared_memory_write`, `shared_memory_list`, `shared_memory_delete`, `shared_memory_cleanup` · `trace_timeline`, `trace_summary`, `session_search`

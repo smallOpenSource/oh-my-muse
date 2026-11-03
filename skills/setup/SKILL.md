@@ -46,7 +46,7 @@ description: "구성요소·의존성을 골라 설치하는 오케스트레이�
 - **setup-playwright** — Playwright + 브라우저 + Xvfb(RHEL8/Rocky8 폴백). (`ultra-ui-qa`·`audit-web-page`·`play-qa` 의존성)
 - **docs-setup** — arch-diagram·pdf-vision-extract 의존성(python-pptx·pymupdf·plantuml). (의존: python)
 - **motion-graphic-setup** — hyperframes(무료 모션 그래픽 CLI) 전제조건(Node≥22 + ffmpeg → `npx hyperframes`). (`motion-graphic-make` 의존성)
-- **3d-intro-setup** — Azure Sora-2/gpt-image-2 3D 인트로용 크레덴셜·의존성(Node/ffmpeg) + 무과금 프리플라이트. (`3d-intro-build` 의존성)
+- **3d-intro-setup** — 3D 인트로용 실행 환경(ffmpeg·Node·Playwright/Chromium) 점검. 이미지·영상 생성은 내장 media 파이프라인이라 API 키·크레덴셜이 필요 없다. (`3d-intro-build` 의존성)
 
 ### 2. 실행
 선택된 각 항목을 호출한다(미선택은 건드리지 않음).
