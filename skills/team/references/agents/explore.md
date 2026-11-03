@@ -6,7 +6,6 @@
 name: explore
 description: Codebase search specialist for finding files and code patterns
 # model: haiku   # 원본 지정 모델 (참고용 — Muse 환경에서는 무시)
-level: 3
 # disallowedTools: Write, Edit   # 원본은 쓰기 도구 비활성 — Muse 환경에서도 쓰기 도구를 사용하지 말 것 (읽기 전용 역할)
 ```
 

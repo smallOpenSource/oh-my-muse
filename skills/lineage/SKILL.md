@@ -1,7 +1,7 @@
 ---
 name: lineage
 description: "현재 세션(들)의 대화를 카카오톡 스타일 단일 HTML로 export. Muse 답변=1줄 요약+클릭 펼침(마크다운 렌더), 하네스 노이즈 자동 필터, 다중 세션 병합, secret 자동 redaction. 기본은 세션 모델 검토(요약·턴 선별), --rulebase는 규칙만. 사용자가 '대화 export'/'카톡 스타일 html'/'lineage'라고 요청하면 사용."
-version: 3.0.2
+version: 3.1.2
 schema_version: 1
 ---
 
@@ -15,6 +15,8 @@ schema_version: 1
 Muse 본문은 **마크다운으로 렌더**(헤딩·리스트·표·코드·인용·강조·링크)되고, 하네스가 주입한
 노이즈(스킬 본문·compaction 요약·조작 명령·에코 교환)는 **기본으로 걸러진다**.
 Secret 자동 redaction. 규칙 단계는 결정론(turn uuid·요약기버전 캐시)이고, 세션 모델의 검토 결정은 캐시해 다음 실행에 다시 쓴다.
+
+> **3.0.6** — 글자 방향을 바꾸는 제어 문자 9자(U+202A~202E, U+2066~2069)는 `--no-markdown` 이어도 `[U+202E]` 처럼 보이는 표지로 넣는다(3.0.9 부터 페이지 제목도). 화면의 글자 순서가 실제와 달라 보이는 속임수를 막기 위해서다. 방향 표시(LRM, RLM, ALM)는 그대로 둔다.
 
 > **3.0.0 — 기본 흐름이 세션 모델 검토로 바뀌었습니다.**
 > - 규칙이 1차로 정리한 턴을 세션 모델이 다시 검토한다. 요약 줄을 직접 쓰고, 남길 턴과 뺄 턴을 고른다.
@@ -118,7 +120,7 @@ Python 은 3.7 이상을 쓴다.
    - 캐시 폴더에 쓸 수 없으면 이번 결정을 저장하지 못한다는 WARN 을 한 번 낸다. 앞선 실행이 남긴 결정은 읽는다.
 5. **마무리** — 출력 HTML 경로를 알린다.
    - 렌더가 성공하면 스크립트가 묶음, 파트 파일, 결정 파일, 게이트 샘플을 지운다. redact 된 세션 본문이 들어 있기 때문이다. 실패(exit 2)면 남겨 둔다.
-   - 렌더가 `reviewers dropped N typed user turn(s)` WARN 을 내면, 검토자가 뺀 사용자 입력 턴의 수와 id 를 사용자에게 알린다. 검토자가 기록 속 주입 문장을 따랐을 수 있다.
+   - 렌더가 `reviewers dropped N typed user turn(s)` WARN 을 내면, 검토자가 뺀 사용자 입력 턴의 수와 id 를 사용자에게 알린다. 검토자가 기록 속 주입 문장을 따랐을 수 있다. `meta: true` 턴과 `!` 명령 뒤 하네스가 쓴 출력 턴(`<bash-stdout>` 블록 뒤 `<bash-stderr>` 블록, 실패하면 `<bash-stderr>` 블록 하나만 있는 턴. 가리기 전 글로 본다)은 세지 않는다.
    - 렌더가 `the page still holds secret-like text (<패턴>=N)` WARN 을 내면, 패턴 이름과 수를 사용자에게 알리고 공유하기 전에 페이지를 확인하라고 말한다. 검토자 패턴이 렌더된 페이지 글에서 다시 찾은 값이다(예: 마크다운으로 꾸민 `**Password**: 값`). 그 값을 `LINEAGE_REDACT_EXTRA` 에 넣어 다시 만들 수 있다(값을 명령줄에 그대로 치면 셸 기록에 남는다). 다시 만들어도 앞서 만든 페이지(`--rulebase` 는 그 옆의 게이트 샘플도)는 그 값을 가진 채 남으므로 지우라고 알린다.
    - 품질 게이트는 1단계나 4단계에 `--reviewer-output <판정 파일>` 을 줄 때만 돈다. 검토자가 이미 모든 턴을 봤으므로 기본 흐름은 샘플을 쓰지 않는다.
    - 판정 파일에는 아직 없는 경로를 준다. 그 자리에 판정 목록이 아닌 것(사용자 파일, 폴더, 판정 모양이 아닌 JSON)이 있으면 스크립트는 샘플을 쓰기 전에 exit 2 로 멈추고 그 파일을 건드리지 않는다. 1단계에 준 경로도 검토자를 띄우기 전에 exit 2 로 멈춘다.
@@ -168,8 +170,10 @@ Python 은 3.7 이상을 쓴다.
 
 ```
 --all-sessions          → 프로젝트 폴더의 모든 *.jsonl (레코드단위 시간순 병합)
+                           Codex 안이면 첫 기록(session_meta)의 cwd 가 지금 폴더인 rollout 전부
   또는 단일 세션:
-auto-discover (~/.claude/projects/<encoded-cwd>/*.jsonl most-recent)
+auto-discover: Codex 안이면(CODEX_THREAD_ID) <CODEX_HOME>/sessions/*/*/*/rollout-*-<그 id>.jsonl,
+               아니면 (~/.claude/projects/<encoded-cwd>/*.jsonl most-recent)
   → --session FILE 명시
   → --from-transcript - stdin paste
   → 모두 실패 시 exit 2 + 옵션 안내
@@ -180,6 +184,12 @@ auto-discover (~/.claude/projects/<encoded-cwd>/*.jsonl most-recent)
 경로 인코딩: cwd 의 **모든 비영숫자 문자**(`/` `_` `.` `:` `\` 등)를 `-` 로 바꾼다
 (Claude Code 의 실제 project-dir 명명과 일치 — `_` 도 `-` 로). 비-ASCII cwd(한글 등)는
 자동탐색이 빗나갈 수 있으니 `--session` 을 쓴다.
+
+기록 형식은 첫 레코드로 가린다. 첫 레코드가 `session_meta` 이면 Codex rollout 으로 읽는다.
+- 사용자 턴: `event_msg` 의 `user_message`(사용자가 입력한 글). 모델 입력에 들어간 환경, 지침, 주입된 스킬 본문(`response_item` 의 사용자 메시지)은 턴이 아니다.
+- 모델 턴: `event_msg` 의 `agent_message`.
+- 도구 호출: `response_item` 의 `*_call`(이름은 `name`, 없으면 종류). 본문 없는 모델 레코드라 Claude Code 의 `tool_use` 처럼 앞뒤 모델 턴에 합쳐진다. 도구 결과(`*_call_output`)는 읽지 않는다.
+- `compacted` 는 compaction 구분선이다.
 
 Schema-tolerant 파서: 미지 record type → stderr WARN + 다음 line. `v1`/`v2` 같은 schema marker
 발견 시 `--unsafe-schema` 명시 없으면 exit 2. UTF-8 디코드 실패 파일은 그 파일만 건너뛴다(전체 실패 X).
@@ -208,8 +218,9 @@ Schema-tolerant 파서: 미지 record type → stderr WARN + 다음 line. `v1`/`
 
 기본 흐름에서는 검토자 요약이 우선이고, 검토자가 `null` 로 둔 턴만 아래 규칙 요약을 쓴다. `--rulebase` 는 규칙 요약만 쓴다.
 
-- 캐시 hit(`~/.cache/lineage/<schema>/<sid>/<uuid>-<digest>.txt`) → 그대로. digest 는 본문+요약기버전
-  해시라 **요약기를 고치면 자동 무효화**된다.
+- 캐시 hit(`~/.cache/lineage/<schema>/<sid>/<uuid>-<digest>.md`. `.txt` 는 3.0.2 까지 쓴 이름이고, 요약기 버전 4 부터 그 캐시는 쓰지 않는다) → 그대로. digest 는 본문+요약기버전
+  해시다. 요약기나 가림을 바꾼 판은 요약기 버전(`SUMMARIZER_VERSION`)을 올려 옛 캐시를 쓰지 않는다. 버전을 그대로 두고 바꾸면 옛 요약이 다시 쓰인다(3.0.8 이 그랬다).
+- 캐시는 64KiB 이하의 일반 파일만 읽고 링크는 따르지 않는다. 그 자리의 FIFO, 링크, 큰 파일, 깊게 중첩된 결정 캐시는 읽지 못한 것으로 보고 다시 요약한다(3.0.6).
 - miss → head+tail 추출(도입이 순수 의도문이면 결론절을 끝에서 읽어 승격) + 0600 캐시 쓰기.
 - 요약 저장은 항상 **redact 적용 후**(평문 secret 이 디스크에 남지 않음).
 
@@ -217,7 +228,8 @@ Schema-tolerant 파서: 미지 record type → stderr WARN + 다음 line. `v1`/`
 
 1차 `detect-secrets>=1.5`(pip 설치 시), 미설치 → 내장 fallback + WARN.
 내장: AWS IAM(AKIA/ASIA)·GitHub PAT·Slack·JWT·private key·한/영 평문 password·Shannon entropy≥4.5.
-확장 `--redact-extra "k1,k2"`(`LINEAGE_REDACT_EXTRA` 환경변수로 기본 주입, 쉼표구분). 부분 마스킹 `--redact-mode mask`(페이지 패턴만. 검토자 패턴이 찾은 값은 늘 전부 가린다).
+확장 `--redact-extra "k1,k2"`. 부분 마스킹 `--redact-mode mask`(페이지 패턴만. 검토자 패턴이 찾은 값은 늘 전부 가린다).
+쪼개진 값도, 쪼개는 글자를 뺀 모양을 패턴이 찾으면 그 구간에서만 글자를 빼고 통째로 가린다(3.0.8). 쪼개는 글자는 보이지 않는 글자(폭 없는 공백, 소프트 하이픈, 변형 선택자 같은 기본 무시 글자와 서식 문자), 공백, 탭, 줄바꿈이 아닌 제어 문자와 특수 공백, 사용자 정의 영역 글자, 점자 빈칸, U+FFFC, U+FFFD 다. 지금 모양 그대로 패턴이 찾는 값을 반으로 가르게 되면 잇지 않는다. 다시 이은 결과가 보이는 글자 가운데 3.0.7 의 한 번이 가린 글자는 3.0.7 의 표식으로 다시 가리고(`KEY=` 처럼 3.0.7 이 값과 한 덩어리로 가린 앞 글자는 값 표식 옆의 표식 하나가 된다), 어떤 종류의 값이든 3.0.7 보다 적게 가리면 3.0.7 한 번의 결과에서 이어 간다. 그래서 3.0.7 이 가리던 글자는 모두 그대로 가린다. 비밀 밖의 글은 바꾸지 않고, 다시 이은 비밀 바로 옆의 그런 글자는 함께 빠질 수 있다. 무엇이든 이었으면 결과가 더 바뀌지 않을 때까지 되풀이한다(최대 네 번).
 
 ### 5. Render
 
@@ -230,7 +242,7 @@ Schema-tolerant 파서: 미지 record type → stderr WARN + 다음 line. `v1`/`
   (Ctrl/Cmd/Alt·한글 IME 안전 — `e.code` 우선이라 브라우저 기본 동작을 가로채지 않음.)
 - 우하단 `?` 버튼으로 범례/단축키 오버레이(배경 클릭으로만 닫힘).
 
-**출력 파일명**: 기본 `work/lineage-{session-name}.html`(`customTitle` 슬러그, 없으면 sid 앞 8자;
+**출력 파일명**: 기본 `work/lineage-{session-name}.html`(`customTitle` 슬러그, 없거나 슬러그에 키 같은 비밀 모양이 남으면 sid 앞 8자;
 `--all-sessions` 는 `all-sessions`). basename 끝에 `_YYMMDD+HHMM` 자동 부착(이미 있으면 그대로 — idempotent).
 
 ### 6. Verify (self-test)
@@ -266,12 +278,13 @@ WARN 발견 시 stderr 보고, 출력은 그대로 작성(인간 검토 가능).
 검토자 결정 캐시(`<uuid>-<digest>-llm.json`)도 redact 하고 자른 요약만 담는다. digest 는 redact 된 본문, 그 턴의 규칙 결정, keep 플래그의 해시다. 본문이 바뀌면 다시 검토한다. `keep: null` 은 그 실행의 규칙을 따른다는 뜻이라, 규칙 결정이나 keep 플래그가 다른 실행(`--keep-trivia` 실행과 기본 실행, `--all-sessions` 실행과 단일 세션 실행)에서도 다시 검토한다.
 검토 묶음과 파트 파일은 redact 된 본문만 담고 0600 으로 쓴다(임시 파일은 mkstemp). 렌더가 성공하면 스크립트가 지운다(실행 절차 5).
 stdin(`--from-transcript -`)으로 넣은 기록의 턴 id 는 본문을 캐시 폴더의 무작위 키(`stdin-id.key`, 0600)로 HMAC 한 값이다. 같은 머신에서는 id 가 그대로라 캐시를 다시 쓰고, 파트 파일을 읽는 모델은 id 로 본문을 맞혀 볼 수 없다.
-검토자가 읽는 파트 파일은 `--redact-mode mask` 여도 가린 자리에 값의 일부를 남기지 않는다. 페이지에는 없는 패턴(Anthropic, OpenAI, Google 키, 따옴표 없는 password·비밀번호, 16진 키, URL 안 자격 증명, Bearer 토큰, Basic 인증 헤더, curl `-u` 의 사용자와 비밀번호 등)도 파트 파일에서는 가린다. URL 의 비밀번호는 호스트 앞 마지막 `@` 까지 가린다. 이 패턴은 엔트로피 규칙보다 먼저 적용해 키를 통째로 가린다. 3.0.2 부터 검토자 패턴은 모든 페이지(기본 흐름과 `--rulebase`)에도 건다. 페이지에서도 검토자 패턴이 찾은 값은 `--redact-mode mask` 여도 전부 가리고, 페이지 패턴만 mask 를 따른다. 본문, 요약, 접힌 요약, 에이전트 이름, 세션 이름, 기본 흐름 묶음에 걸고, 도구 이름은 `--redact-extra` 키워드를 가린다. 렌더 뒤 페이지 글에 검토자 패턴을 다시 돌려 남은 것이 있으면 WARN 을 낸다. `--rulebase` 출력은 비밀이 없는 턴에서 2.x 와 같다. 비밀을 가린 턴은 2.x 와 다를 수 있다.
+검토자가 읽는 파트 파일은 `--redact-mode mask` 여도 가린 자리에 값의 일부를 남기지 않는다. 페이지에는 없는 패턴(Anthropic, OpenAI, Google 키, 따옴표 없는 password·비밀번호, 16진 키, URL 안 자격 증명, Bearer 토큰, Basic 인증 헤더(따옴표 친 키, 첨자 대입, `=>`, 헤더 설정 호출과 HAR 의 name/value, nginx 처럼 공백 뒤 따옴표 포함), curl `-u` 의 사용자와 비밀번호(붙여 쓴 `-uUSER:PW`, `-su`, `-4u` 같은 묶음, 따로 감싼 `"USER":"PW"`, 따옴표 친 명령 속의 이스케이프한 따옴표(`\"USER:PW\"`, 여러 겹 JSON), bash 의 `'\''` 와 `shlex.quote` 의 `'"'"'`, cmd 의 `^"`, PowerShell 의 `` `" ``, bash 의 `$'…'`, `${API_USER}` 같은 변수 사용자와 변수에 이은 사용자(`"$USER"@corp.com`, `"${ENV}"-deployer`), 인라인 코드나 괄호 안, 인자 목록, 빈 사용자나 빈 비밀번호 포함))도 파트 파일에서는 가린다. URL 의 비밀번호는 호스트 앞 마지막 `@` 까지 가린다. 이 패턴은 엔트로피 규칙보다 먼저 적용해 키를 통째로 가린다. 3.0.2 부터 검토자 패턴은 모든 페이지(기본 흐름과 `--rulebase`)에도 건다. 페이지에서도 검토자 패턴이 찾은 값은 `--redact-mode mask` 여도 전부 가리고, 페이지 패턴만 mask 를 따른다. 본문, 요약, 접힌 요약, 에이전트 이름, 세션 이름, 기본 흐름 묶음에 걸고, 도구 이름은 `--redact-extra` 키워드를 가린다. 렌더 뒤 페이지 글에 검토자 패턴을 다시 돌려 남은 것이 있으면 WARN 을 낸다. `--rulebase` 출력은 검토자 패턴과 쪼갠 값 잇기가 아무것도 찾지 않고 방향 제어 글자가 없는 턴에서 2.x 와 같다. 비밀을 가린 턴은 2.x 와 다를 수 있다. `password: string` 처럼 지나치게 가린 턴과 방향 제어 글자를 표지로 바꾼 턴도 그렇다.
 파트 파일의 규칙 요약은 가린 본문에서 만든다. 요약을 자른 자리에 비밀이 걸쳐도 조각이 남지 않는다.
-`--redact-extra` 키워드 목록은 묶음과 파트 파일에 쓰지 않고, 가린 수만 `custom` 으로 센다. 파트 파일의 본문, 요약, 에이전트 이름, 도구 이름에서는 키워드를 가린다. 묶음은 에이전트 이름, 도구 이름, 세션 제목, 출력 경로를 페이지처럼 그대로 둔다. 기록 파일 이름(세션 id)도 캐시 위치를 정하는 값이라 그대로 둔다(0600, 렌더 성공 뒤 삭제).
+`--redact-extra` 키워드 목록은 묶음과 파트 파일에 쓰지 않고, 가린 수만 `custom` 으로 센다. 파트 파일의 본문, 요약, 에이전트 이름, 도구 이름에서는 키워드를 가린다. 묶음의 에이전트 이름과 세션 이름은 페이지처럼 키워드를 가리고, 도구 이름, 페이지 제목(`--title`), 출력 경로는 그대로 둔다. 기록 파일 이름(세션 id)도 캐시 위치를 정하는 값이라 그대로 둔다(0600, 렌더 성공 뒤 삭제).
 결정 파일은 세션이 파일 도구로 써서 umask 권한으로 생긴다. `--apply-review` 가 읽을 때 0600 으로 바꾼다.
 검토자 요약은 `--redact-mode` 와 관계없이 검토자 패턴으로 먼저 전부 가린 뒤 페이지 redaction 을 건다. 캐시를 거쳐 다음 검토자와 게이트의 critic 에게 다시 가기 때문이다. 가린 것이 있으면 어느 턴인지 WARN 으로 알린다(`reviewer-summary` 로 집계).
-캐시키에 요약기 버전이 포함돼 알고리즘 변경 시 자동 무효화. 스키마 bump 시 옛 디렉토리는 참조 안 됨 — `--purge-cache` 로 정리 권장.
+캐시키에 요약기 버전이 포함된다. 요약기나 가림을 바꾼 판은 요약기 버전(`SUMMARIZER_VERSION`)을 올려 옛 캐시를 쓰지 않는다. 스키마 bump 시 옛 디렉토리는 참조 안 됨 —
+`--purge-cache` 로 정리 권장.
 
 ## Testing
 
@@ -315,14 +328,16 @@ cd ~/workspace/skills/lineage && python3 -m unittest test_lineage   # Python 3.7
 ## 한계
 
 - 자동탐색은 Claude Code 의 `~/.claude/projects/` 레이아웃을 가정 — 비-ASCII cwd 는 `--session` / `--from-transcript` 로 쓴다.
-- 읽을 수 있는 기록은 Claude Code 형식뿐이다. Codex 의 rollout 은 0턴으로 읽히므로, Codex 에서는 Claude Code 기록을 내보낼 때만 쓴다.
+- 읽는 기록은 Claude Code 형식과 Codex rollout 이다. Codex rollout 에서는 사용자가 입력한 글, 모델의 답, 도구 호출 이름만 읽는다. 모델의 추론 요약과 도구 결과는 페이지에 없다.
+- Codex 는 rollout 형식을 공개 약속으로 내놓지 않는다. 사용자 턴을 하나도 읽지 못한 rollout 은 빈 페이지 대신 exit 2(`no user turn was read`, Codex 버전 표시)로 멈춘다. 이 오류가 나면 사용자에게 banker 업데이트를 권하고, Codex 를 업데이트했다면 `banker doctor` 의 기록 형식 점검 결과를 함께 보인다. `--all-sessions` 는 그런 rollout 을 WARN 과 함께 뺀다.
 - 기본 흐름은 redact 된 세션 본문을 세션 모델의 프로바이더로 보낸다. 모델에 보내지 않으려면 `--rulebase` 를 쓴다.
 - `--rulebase` 요약은 추출식(head+tail) — 말미 정리 문장을 결론 대신 고르는 경우가 있다. 기본 흐름은 검토자가 이를 고쳐 쓴다.
 - 기본 흐름은 파트(40턴 이하, 고르게 나눔)마다 검토 에이전트 1개가 돈다. 이 저장소 실측은 40턴 파트 하나에 약 11만 토큰과 7분이었다. 긴 세션은 `--last N` 으로 범위를 줄이거나 `--rulebase` 를 쓴다.
 - 서브에이전트 검토자는 파트 파일 읽기만 하고, 파일 쓰기·고치기·웹·MCP·하위 에이전트를 쓰지 않는 것은 지시로 선다.
-- 규칙 요약은 가린 본문에서 자른다(요약기 버전 3). 0.15.1 까지 만든 요약 캐시는 쓰지 않는다. 그 캐시에는 평문 조각이 남아 있을 수 있어 `--purge-cache` 로 지운다.
+- 규칙 요약은 가린 본문에서 자른다(요약기 버전 4). 3.0.8 까지 만든 요약 캐시는 쓰지 않는다. 그 캐시에는 평문 조각이 남아 있을 수 있어 `--purge-cache` 로 지운다.
 - 규칙 요약 캐시는 본문만으로 키를 잡는다. `--redact-mode` 나 `--redact-extra` 를 바꿔 다시 돌린 `--rulebase` 는 앞선 실행의 요약을 쓸 수 있다(2.x 동작 그대로). 기본 흐름의 묶음은 요약을 매번 새로 만든다. 묶음 형식은 `lineage-review/2` 라 0.15.1 이 만든 묶음은 `--emit-review` 부터 다시 한다.
 - 검토자는 긴 턴의 앞뒤만 본다(`clipped: true`). 가운데에만 있는 결론은 놓칠 수 있다.
+- 페이지 패턴 가운데 JWT 와 개인 키 패턴은 같은 머리(`eyJ`, `-----BEGIN`)가 긴 줄에 되풀이되면 시간이 줄 길이의 제곱으로 는다(2.x 동작 그대로).
 - 마크다운의 **중첩 리스트는 평탄화**되고 각주는 미지원.
 - 사용자가 질문에 래퍼 블록(`<task-notification>…`)을 **인용**하면 문장은 남고 그 블록만 사라진다.
 - 에코/의도문 판정 문턱은 단일 코퍼스 튜닝값 — 과삭제는 stderr의 유형별 카운트로 가시화된다.
@@ -338,7 +353,7 @@ cd ~/workspace/skills/lineage && python3 -m unittest test_lineage   # Python 3.7
 
 ~/.cache/lineage/
 ├── stdin-id.key   (stdin 턴 id 의 HMAC 키, 0600. --purge-cache 로 지우면 stdin id 가 바뀐다)
-└── <schema_version>/<session_id>/<turn_uuid>-<digest>.txt       (규칙 요약, 0700/0600)
+└── <schema_version>/<session_id>/<turn_uuid>-<digest>.md        (규칙 요약, 0700/0600)
                                   <turn_uuid>-<digest>-llm.json  (검토자 결정)
 
 work/.lineage-review.json, .lineage-review.part-K.json   (검토 중에만, 0600)

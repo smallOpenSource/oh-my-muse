@@ -17,13 +17,22 @@
  * `const input`, runs the HUD in-process and keeps spawnSync for a fallback
  * branch. A block anchored on spawnSync would land in that branch, so the ctx
  * line is the only anchor. Earlier versions that also put a block before
- * spawnSync are converted on the next `on`.
+ * spawnSync are converted on the next `on`. Wrapper v4 (setup-omc-hud 0.20.0)
+ * shows the size in its own PL segment, so `on` and `status` point there.
  *
  * The block imports a copy of payload-size.mjs kept beside the wrapper
  * (<hud>/payload-mon/payload-size.mjs), not the module in this folder: a plugin
  * install lives under a versioned path that the next update retires, and an
  * import pointing there would go dark without a word. `on` writes the copy and
  * refreshes it when this version's module differs; `status` says when it does.
+ * When the wrapper file itself is a symlink, the copy goes beside the file it
+ * points at, where wrapper v4 looks first. A copy folder (payload-mon/) that is
+ * itself a link is neither written nor emptied through: `on` refuses it, and
+ * also refuses (taking its copy back) when the folder changes while it writes.
+ *
+ * The block takes the ctx line's line ending, so a CRLF wrapper stays CRLF, and
+ * a block whose line endings an editor rewrote still counts as on. A wrapper
+ * that starts with a BOM is taken as it is.
  *
  * `on` converges on the current block and is a no-op when it is in place. It
  * writes only into the OMC custom HUD (signature-gated); `off` removes only
@@ -33,11 +42,13 @@
  * Exit status 1 means nothing was changed; 2 means an unexpected error stopped
  * the command partway, so check `status`.
  */
+import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -49,20 +60,35 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CACHE_DIR, clearCache, estimatePayloadBytes, REQUEST_LIMIT_BYTES, SHOW_FROM_BYTES } from "./payload-size.mjs";
 
 const OPEN = "// >>> payload-mon >>>";
 const CLOSE = "// <<< payload-mon <<<";
-const BLOCKS = /^[ \t]*\/\/ >>> payload-mon >>>[\s\S]*?\/\/ <<< payload-mon <<<[ \t]*\r?\n/gm;
+export const BLOCKS = /^[ \t]*\/\/ >>> payload-mon >>>[\s\S]*?\/\/ <<< payload-mon <<<[ \t]*\r?\n/gm;
+// The closing line. No block reaches past the last one, so the pattern runs only on the text before it:
+// otherwise every stray opening line scans to the end again (a 2MB file of them took 28s).
+export const CLOSE_LINE = /\/\/ <<< payload-mon <<<[ \t]*\r?\n/g;
 // The block goes right after the line that adds ctx.
 const CTX_LINE = /^ {2}if \(f\.ctx\) colored\.push\(colorCtx\(f\.ctx\)\);\r?\n/m;
 // The statusline JSON the block reads, in either layout.
 const INPUT_DECL = /^(?:let|const) input\b/m;
+// Wrapper v4 pushes its own PL segment: the size from 0MB on, in place of the block's segment.
+const PL_SEGMENT = /colored\.push\(`PL:/;
 const MB = 1024 * 1024;
 
-const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+// The same rules as setup-omc-hud's installer (OMC's getClaudeConfigDir): trim, expand a leading "~",
+// make it absolute, drop a trailing separator. A value no shell expanded ("~/x" in quotes) still finds
+// the wrapper the installer put there.
+function configDir() {
+  const v = (process.env.CLAUDE_CONFIG_DIR || "").trim();
+  if (!v) return join(homedir(), ".claude");
+  if (v === "~") return homedir();
+  if (v.startsWith("~/") || v.startsWith("~\\")) return join(homedir(), v.slice(2));
+  return resolve(v);
+}
+const CONFIG_DIR = configDir().replace(/[\\/]+$/, "");
 
 const DEFAULTS = {
   hudFile: process.env.PAYLOAD_MON_HUD_FILE || join(CONFIG_DIR, "hud", "omc-hud-custom.mjs"),
@@ -73,13 +99,29 @@ const DEFAULTS = {
   sessionId: process.env.CLAUDE_CODE_SESSION_ID,
 };
 
-// Where the block's module lives: beside the wrapper, outside any versioned path.
-const moduleCopy = (hudFile) => join(dirname(hudFile), "payload-mon", "payload-size.mjs");
+// The file a wrapper that is itself a symlink (dotfiles) points at; any other path as it is. A wrapper
+// reached through a linked folder keeps the path as configured.
+function linkTarget(hudFile) {
+  try {
+    return lstatSync(hudFile).isSymbolicLink() ? realpathSync(hudFile) : hudFile;
+  } catch {
+    return hudFile;
+  }
+}
+// Where the block's module lives: beside the wrapper, outside any versioned path. For a wrapper file
+// that is a link, beside the file it points at: wrapper v4 resolves its own path through the link and
+// looks there for its PL segment.
+const moduleCopy = (hudFile) => join(dirname(linkTarget(hudFile)), "payload-mon", "payload-size.mjs");
+// Where 0.20.1 put the copy for such a link; `off` clears it too.
+const besideLink = (hudFile) => join(dirname(hudFile), "payload-mon", "payload-size.mjs");
 const moduleUrl = (hudFile) => pathToFileURL(moduleCopy(hudFile)).href;
+
+// The ctx line's line ending, which the block takes so that a CRLF wrapper stays CRLF.
+const eolOf = (src) => (CTX_LINE.exec(src)?.[0].endsWith("\r\n") ? "\r\n" : "\n");
 
 // Right after ctx, colored like the 5h/wk rates: % on the ctx scale, MB in cyan.
 // Its names are block-scoped, so none can clash with the wrapper's own.
-const placeBlock = (url) =>
+const placeBlock = (url, eol = "\n") =>
   [
     "  " + OPEN,
     "  // payload-mon: estimated API request payload against the 32MB request limit, shown",
@@ -97,11 +139,18 @@ const placeBlock = (url) =>
     "  }",
     "  " + CLOSE,
     "",
-  ].join("\n");
+  ].join(eol);
 
-const insertBlock = (base, url) => base.replace(CTX_LINE, (line) => line + placeBlock(url));
+const insertBlock = (base, url) => base.replace(CTX_LINE, (line) => line + placeBlock(url, eolOf(line)));
 
 const count = (text, needle) => text.split(needle).length - 1;
+
+// The text without its blocks, the pattern run only up to the last closing line (see CLOSE_LINE).
+function withoutBlocks(src) {
+  let end = -1;
+  for (const m of src.matchAll(CLOSE_LINE)) end = m.index + m[0].length;
+  return end < 0 ? src : src.slice(0, end).replace(BLOCKS, "") + src.slice(end);
+}
 
 // The wrapper's text, null when there is no such file. Any other read failure
 // (permissions, say) is not "missing" and propagates.
@@ -124,18 +173,21 @@ const readBytes = (file) => {
 
 const refusal = (why, hudFile) => ({ ok: false, message: `${why}. 래퍼를 그대로 두었습니다: ${hudFile}` });
 
-// The block exactly as `on` writes it for this URL, once, right after the ctx line.
-function inPlace(src, url) {
-  if (count(src, OPEN) !== 1 || count(src, CLOSE) !== 1) return false;
+// The line ending ("\n" or "\r\n") of the block that sits, exactly as `on` writes it for this URL,
+// once, right after the ctx line; "" when it does not. Either ending counts as in place, so a block
+// whose line endings an editor rewrote is still on.
+function blockEol(src, url) {
+  if (count(src, OPEN) !== 1 || count(src, CLOSE) !== 1) return "";
   const ctx = CTX_LINE.exec(src);
-  return ctx !== null && src.startsWith(placeBlock(url), ctx.index + ctx[0].length);
+  if (ctx === null) return "";
+  return ["\n", "\r\n"].find((eol) => src.startsWith(placeBlock(url, eol), ctx.index + ctx[0].length)) ?? "";
 }
 
 // Why the block cannot go into this wrapper, or "" when it can. Markers that do
 // not pair up would let the block pattern swallow the code between them.
 function misfit(src) {
   if (count(src, OPEN) !== count(src, CLOSE)) return "payload-mon 표시(>>> / <<<)의 짝이 맞지 않습니다";
-  const base = src.replace(BLOCKS, "");
+  const base = withoutBlocks(src);
   if (!base.includes("omc-hud.mjs") || !base.includes("const colorRate")) return "OMC 커스텀 HUD 래퍼가 아닙니다";
   if (!INPUT_DECL.test(base)) return "삽입 위치를 찾지 못했습니다(statusline 입력을 담는 input 변수가 없음)";
   if (!CTX_LINE.test(base)) return "삽입 위치를 찾지 못했습니다(ctx를 넣는 줄이 없음)";
@@ -150,19 +202,60 @@ function copyState(o) {
   return source !== null && copy.equals(source) ? "current" : "stale";
 }
 
+// Whether the folder holding `file` is a link. The copy folder is this tool's, and a link there
+// would take the copy, or its removal, to wherever it points.
+function linkedFolder(file) {
+  try {
+    return lstatSync(dirname(file)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // Replaces file through a fresh temp file ("wx") and a rename: a link planted at
 // either name is replaced rather than written through, and a write that fails
 // leaves the old file as it was.
 function writeFresh(file, data, mode) {
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   rmSync(tmp, { force: true });
   try {
     writeFileSync(tmp, data, { flag: "wx", mode });
+    const id = fileId(tmp);
     renameSync(tmp, file);
+    return id;
   } catch (e) {
     rmSync(tmp, { force: true });
     throw e;
   }
+}
+
+// A file's identity, exact: NTFS file IDs pass 2^53, where a Number loses the low bits.
+const fileId = (p) => {
+  const s = lstatSync(p, { bigint: true });
+  return `${s.dev}:${s.ino}`;
+};
+// The copy folder's identity, to tell afterwards whether it is still the folder that was written into.
+const folderStamp = (dir) => {
+  const s = lstatSync(dir, { bigint: true });
+  return `${s.dev}:${s.ino}:${s.isSymbolicLink()}`;
+};
+// After the write: the copy folder must still be the one stamped before, holding these bytes. Another program
+// may have swapped it (for a link, say), so the copy went wherever it led, or put it back after the write, so
+// the copy is not in it. Then the write is refused, and the copy is taken back from where the folder now leads
+// when the file there is the one written (`written`, from writeFresh) and still ours byte for byte: a copy that
+// was there before, or one another program wrote over, stays.
+// Node has no openat, so a copy that went elsewhere through a swap that was put back stays where it went, and
+// a swap after this check goes unseen.
+function checkFolder(copy, stamp, data, written) {
+  const dir = dirname(copy);
+  if (folderStamp(dir) === stamp && readBytes(copy)?.equals(data)) return;
+  try {
+    const landed = join(realpathSync(dir), basename(copy));
+    if (fileId(landed) === written && readFileSync(landed).equals(data)) rmSync(landed, { force: true });
+  } catch {
+    /* nothing there to take back */
+  }
+  throw new Error(`사본 폴더가 쓰는 동안 바뀌었습니다: ${dir}`);
 }
 
 // Brings the copy up to this version's module; true when it had to write. The
@@ -171,11 +264,18 @@ function writeFresh(file, data, mode) {
 // away again: mkdirSync names a folder only when it created it, and rmdir
 // leaves one that something else has meanwhile put a file in.
 function syncModule(o) {
-  if (copyState(o) === "current") return false;
   const copy = moduleCopy(o.hudFile);
+  if (linkedFolder(copy)) throw new Error(`사본 폴더가 링크입니다: ${dirname(copy)}`);
+  if (copyState(o) === "current") return false;
+  // Read first: a module that cannot be read leaves no folder behind.
+  const data = readFileSync(o.moduleSource);
   const made = mkdirSync(dirname(copy), { recursive: true, mode: 0o755 }) !== undefined;
   try {
-    writeFresh(copy, readFileSync(o.moduleSource), 0o644);
+    const stamp = folderStamp(dirname(copy));
+    // From the same lstat: a folder that became a link since the check above is refused before the write.
+    if (stamp.endsWith(":true")) throw new Error(`사본 폴더가 링크입니다: ${dirname(copy)}`);
+    const written = writeFresh(copy, data, 0o644);
+    checkFolder(copy, stamp, data, written);
   } catch (e) {
     if (made) {
       try {
@@ -189,12 +289,14 @@ function syncModule(o) {
   return true;
 }
 
-// The first lines of node's complaint about `text` as an ES module, "" if it parses.
+// The first lines of node's complaint about `text` as an ES module, "" if it parses. A leading BOM
+// is left out: node runs a wrapper that starts with one, but `node --check` rejects a BOM before a
+// shebang (Node 20, 24).
 function syntaxError(text) {
   const dir = mkdtempSync(join(tmpdir(), "payload-mon-"));
   try {
     const file = join(dir, "check.mjs");
-    writeFileSync(file, text);
+    writeFileSync(file, text.replace(/^\uFEFF/, ""));
     const r = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" });
     return r.status === 0 ? "" : String(r.stderr || r.error).trim().split("\n").slice(0, 3).join(" | ");
   } finally {
@@ -239,11 +341,21 @@ const notShownNote = (o) =>
     : `\n주의: statusLine 명령에 ${basename(o.hudFile)}가 보이지 않습니다. ` +
       "다른 래퍼(smart-compact 등)가 HUD를 감싸 호출하면 정상 표시되고, 아니면 화면에 나타나지 않습니다.";
 
+const showsPL = (src) => src !== null && PL_SEGMENT.test(src);
+
+// Where the size shows, named only while it does: the block in place and a
+// module copy to import. "" otherwise, so status never promises a segment.
+function displayWhere(o, src) {
+  if (src === null || blockEol(src, moduleUrl(o.hudFile)) === "" || copyState(o) === "missing") return "";
+  return showsPL(src) ? "PL 칸에 늘 표시" : `${SHOW_FROM_BYTES / MB}MB부터 표시`;
+}
+
 export function turnOn(opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const src = readText(o.hudFile);
   if (src === null) return { ok: false, message: `HUD 래퍼가 없습니다: ${o.hudFile}` };
-  if (inPlace(src, moduleUrl(o.hudFile))) {
+  // In place with the wrapper's own line ending; a block whose ending differs is written again.
+  if (blockEol(src, moduleUrl(o.hudFile)) === eolOf(src)) {
     try {
       const refreshed = syncModule(o);
       return { ok: true, message: (refreshed ? "모듈 사본을 이 버전으로 맞췄습니다." : "이미 켜져 있습니다 (변경 없음).") + notShownNote(o) };
@@ -253,47 +365,62 @@ export function turnOn(opts = {}) {
   }
   const why = misfit(src);
   if (why) return refusal(why, o.hudFile);
-  const done = "켰습니다. 다음 statusline 갱신부터 8MB 이상이면 ctx 옆에 payload가 표시됩니다.";
-  const after = insertBlock(src.replace(BLOCKS, ""), moduleUrl(o.hudFile));
+  const done = showsPL(src)
+    ? "켰습니다. 다음 statusline 갱신부터 PL 칸에 요청 크기가 늘 표시됩니다."
+    : "켰습니다. 다음 statusline 갱신부터 8MB 이상이면 ctx 옆에 payload가 표시됩니다.";
+  const after = insertBlock(withoutBlocks(src), moduleUrl(o.hudFile));
   return commit(o.hudFile, src, after, done + notShownNote(o), () => syncModule(o));
 }
 
 function removeBlocks(o, src) {
   if (src === null) return { ok: true, message: `HUD 래퍼가 없어 끌 것이 없습니다: ${o.hudFile}` };
   if (count(src, OPEN) !== count(src, CLOSE)) return refusal("payload-mon 표시(>>> / <<<)의 짝이 맞지 않습니다", o.hudFile);
-  const out = src.replace(BLOCKS, "");
+  const out = withoutBlocks(src);
   if (out === src) return { ok: true, message: "이미 꺼져 있습니다 (래퍼 변경 없음)." };
   return commit(o.hudFile, src, out, "껐습니다. 다음 statusline 갱신부터 payload가 표시되지 않습니다.");
 }
 
 // What off leaves behind otherwise: the cache (when this account controls its
 // folder), and the module copy with its folder (only when nothing else is in
-// it). Neither failing undoes off.
+// it), also the one 0.20.1 left beside a linked wrapper, but nothing through a copy folder that is a link.
+// None failing undoes off.
+// Returns the copy folders it left alone because they are links.
 function removeLeftovers(o) {
-  const copy = moduleCopy(o.hudFile);
-  for (const remove of [() => clearCache(o.cacheDir), () => rmSync(copy, { force: true })]) {
+  const all = [...new Set([moduleCopy(o.hudFile), besideLink(o.hudFile)])];
+  const copies = all.filter((copy) => !linkedFolder(copy));
+  for (const remove of [() => clearCache(o.cacheDir), ...copies.map((copy) => () => rmSync(copy, { force: true }))]) {
     try {
       remove();
     } catch {
       /* stale numbers or an unused copy; off stands */
     }
   }
-  try {
-    rmdirSync(dirname(copy));
-  } catch {
-    /* absent, or holds something that is not ours */
+  for (const copy of copies) {
+    try {
+      rmdirSync(dirname(copy));
+    } catch {
+      /* absent, or holds something that is not ours */
+    }
   }
+  return all.filter((copy) => !copies.includes(copy)).map((copy) => dirname(copy));
 }
 
 export function turnOff(opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const res = removeBlocks(o, readText(o.hudFile));
-  if (res.ok) removeLeftovers(o);
-  return res;
+  if (!res.ok) return res;
+  // A copy kept in a linked folder still feeds wrapper v4's PL segment, so off says so.
+  const kept = removeLeftovers(o);
+  return kept.length ? { ...res, message: `${res.message} ${KEPT_NOTE}: ${kept.join(", ")}` } : res;
 }
+const KEPT_NOTE = "사본 폴더가 링크라 모듈 사본은 지우지 않았습니다(래퍼 v4 의 PL 칸이 계속 보일 수 있음)";
 
-// "현재 세션: 0.8MB / 32MB (2%), 8MB부터 표시" for the session that runs this, "" if unknown.
-function sessionEstimate(o) {
+// The estimate for the session that runs this, "" if unknown, ending with where
+// it shows when `where` names it:
+//   "현재 세션: 0.8MB / 32MB (2%), PL 칸에 늘 표시"   (wrapper v4, on)
+//   "현재 세션: 0.8MB / 32MB (2%), 8MB부터 표시"      (older wrappers, on)
+//   "현재 세션: 0.8MB / 32MB (2%)"                    (off, or no module copy)
+function sessionEstimate(o, where) {
   if (!o.sessionId || !existsSync(o.projectsDir)) return "";
   const file = `${o.sessionId}.jsonl`;
   const project = readdirSync(o.projectsDir).find((d) => existsSync(join(o.projectsDir, d, file)));
@@ -301,7 +428,7 @@ function sessionEstimate(o) {
   try {
     const bytes = estimatePayloadBytes(join(o.projectsDir, project, file), o.cacheDir);
     const pct = Math.floor((bytes / REQUEST_LIMIT_BYTES) * 100);
-    return `현재 세션: ${(bytes / MB).toFixed(1)}MB / 32MB (${pct}%), ${SHOW_FROM_BYTES / MB}MB부터 표시`;
+    return `현재 세션: ${(bytes / MB).toFixed(1)}MB / 32MB (${pct}%)` + (where ? `, ${where}` : "");
   } catch {
     return "";
   }
@@ -318,8 +445,17 @@ function stateOf(src, o) {
   if (count(src, OPEN) + count(src, CLOSE) === 0) return "꺼짐";
   // on and off both refuse this, so pointing at on would be a dead end.
   if (count(src, OPEN) !== count(src, CLOSE)) return "표시(>>> / <<<)의 짝이 맞지 않습니다 (on·off 모두 거부: HUD 재설치 또는 남은 표시 줄 정리)";
-  if (!inPlace(src, moduleUrl(o.hudFile))) return "켜짐이 불완전하거나 오래됨 (on 으로 복구)";
-  return "켜짐" + COPY_NOTE[copyState(o)];
+  if (blockEol(src, moduleUrl(o.hudFile)) === "") return "켜짐이 불완전하거나 오래됨 (on 으로 복구)";
+  return "켜짐" + copyNote(o);
+}
+
+// What status adds about the module copy. In a copy folder that is a link, on refuses to write it, so
+// pointing at on would be a dead end.
+function copyNote(o) {
+  const state = copyState(o);
+  const copy = moduleCopy(o.hudFile);
+  if (state !== "current" && linkedFolder(copy)) return `, 단 사본 폴더가 링크라 모듈 사본을 쓰지 않음 (링크를 일반 폴더로 바꾼 뒤 on): ${dirname(copy)}`;
+  return COPY_NOTE[state];
 }
 
 // What status says about the wrapper. A wrapper it cannot read is reported, not
@@ -337,7 +473,9 @@ export function status(opts = {}) {
   const lines = [`payload-mon: ${describe(o)} (${o.hudFile})`];
   const note = notShownNote(o);
   if (note) lines.push(note.trim());
-  const estimate = sessionEstimate(o);
+  // null when the wrapper is missing or unreadable; describe has already said which.
+  const src = readBytes(o.hudFile)?.toString("utf8") ?? null;
+  const estimate = sessionEstimate(o, displayWhere(o, src));
   if (estimate) lines.push(estimate);
   return { ok: true, message: lines.join("\n") };
 }

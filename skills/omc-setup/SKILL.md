@@ -50,7 +50,7 @@ description: 이식된 OMC 스킬 모음 안내·관리 — 사용자가 "OMC �
 ## Operating Rules
 
 - 이 스킬은 Claude Code에 OMC를 설치하는 원본 `omc-setup`의 설치 마법사가 아니다. 이 환경에는 설치할 Claude Code 플러그인이 없으므로 설치 플로우는 제공하지 않는다.
-- 비고: 원본의 `phases/` 설치 플로우 파일(01-install-claude-md.md, 02-configure.md, 03-integrations.md, 04-welcome.md)은 Claude Code 전용 설치 단계(CLAUDE.md 설치·HUD 설정·통합 연동)라 이 환경에 불필요하므로 복사하지 않았다.
+- 비고: 원본의 `phases/` 설치 플로우 파일(01-install-claude-md.md, 02-configure.md, 03-integrations.md, 04-welcome.md)은 Claude Code 전용 설치 단계(CLAUDE.md 설치·HUD 설정·통합 연동)라 이 환경에 불필요하므로 복사하지 않았다. v5.7.31에서 01-install-claude-md.md에 `claudeMdEnabled` 옵트아웃 프로브가 추가됐으나, phases/ 미수록이라 미반영.
 - 원본의 슬래시 커맨드(`/omc-setup --local/--global/--force/--help`)는 채팅 요청("OMC 스킬 목록 보여줘" 등)으로 대체된다.
 - 원본의 `scripts/setup-claude-md.sh`, `scripts/setup-progress.sh` 호출은 이 환경에 해당 스크립트가 없으므로 수행하지 않는다. 요구받으면 불가함을 명시한다.
 - 새 스킬 추가 시 이식 규칙: 프론트매터 `name` 유지·`description`만 한국어 트리거 문구로 작성, 불필요 메타(level/aliases/argument-hint) 제거, Task tool → `subagent.spawn`, `~/.claude/` → `~/workspace/`, 외부 모델·hooks 불가 항목은 Operating Rules에 한계 명시.

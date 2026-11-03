@@ -125,7 +125,7 @@ description: 사용자가 "팀으로 작업해줘", "N명의 에이전트로 병
 
 ### 동작 불가 요소와 대안
 
-1. **tmux 기반 팀 오케스트레이션 불가** — 원본의 `omc team` / `omc-teams` 멀티플렉서 워커 방식은 이 환경에서 동작하지 않는다. 대안: 모든 워커를 `subagent.spawn`으로 병렬 실행한다.
+1. **tmux 기반 팀 오케스트레이션 불가** — 원본의 `omc team` 멀티플렉서 워커 방식은 이 환경에서 동작하지 않는다 (업스트림 v5.7.31에서 `/omc-teams` 호환 표면 제거됨). 대안: 모든 워커를 `subagent.spawn`으로 병렬 실행한다.
 2. **외부 CLI 모델 연동 불가** — Codex/Gemini/Antigravity/Cursor 등 외부 모델 워커(`codex_worker`, `gemini_worker`, `antigravity_worker`)는 지원하지 않는다. 대안: 모든 역할은 Muse 기반 subagent로 실행하며, provider 라우팅 개념은 사용하지 않는다.
 3. **Claude Code implicit agent team 메시징 서피스 없음** — 워커↔리드 간 자동 전달 대화 채널이 없다. 대안: `subagent.spawn` 결과는 부모 세션에 자동 전달되므로, 리드가 결과를 직접 수집하고 다음 스테이지/워커 프롬프트에 문맥을 넣어 분배한다. 원본의 `shutdown_request`/`shutdown_response` 프로토콜도 동일하게 결과 수집으로 대체한다.
 4. **`state_write`/`state_read` MCP 없음** — 대안: 팀 상태는 `~/workspace/team/<slug>/state.json` 파일로 저장·조회한다.

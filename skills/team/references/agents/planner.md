@@ -4,7 +4,6 @@
 > 참고: 원본 정의 (oh-my-claudecode 플러그인, Claude Code 전용)
 > - description: Strategic planning consultant with interview workflow (Opus)
 > - model: opus
-> - level: 4
 > <!-- Muse 환경에 없는 에이전트 frontmatter(모델 지정, Task 도구 연동, /슬래시 커맨드 연동 등)는 적용하지 않는다. 이 파일은 역할 프롬프트로만 사용한다. -->
 > <!-- AskUserQuestion 도구는 Muse의 질문 도구(옵션 제시)로, explore/agent 위임은 subagent.spawn으로, /슬래시 커맨드는 팀 플로우(실행 시작)로 일반화한다. -->
 

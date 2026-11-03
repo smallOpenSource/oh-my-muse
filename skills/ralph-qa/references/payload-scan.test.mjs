@@ -5,9 +5,10 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { PATTERNS, entropy, scan } from "./payload-scan.mjs";
+import { symlinkSkip } from "../../../scripts/test-fixtures/can-symlink.mjs";
 
 const SCAN = fileURLToPath(new URL("./payload-scan.mjs", import.meta.url));
 
@@ -55,6 +56,9 @@ const FAKES = {
   ["config-pass" + "word"]: "  POSTGRES_PASS" + "WORD: example123",
   ["dockerfile-env-pass" + "word"]: "ENV DB_PASS" + "WORD hunter22xyz",
   "curl-user": "curl -u admin:" + "Hunter22pw https://x",
+  ["netrc-pass" + "word"]: "machine api.example.com login bob pass" + "word Netrc-V4lue",
+  "pgpass-line": "db.internal:5432:app:bob:" + "Pg-V4lue",
+  "docker-auth": '{"auths": {"registry.example.com": {"au' + 'th": "' + Buffer.from("bob:" + "Dock3r-V4lue").toString("base64") + '"}}}',
 };
 
 test("every pattern has a sample it catches, by its own name", () => {
@@ -210,30 +214,44 @@ test("each private key closes at the first END marker after it, in time linear i
 });
 
 test("long lines take linear time, so a big generated file cannot stall the check", () => {
-  // A key name over and over with its separator: each lookahead stops after 256 characters. The
-  // time of the whole text against a quarter of it: about 4 when linear, about 16 when quadratic,
-  // whatever the load on the machine, as both are timed alike, in turn, at their best of three.
-  const SHAPES = [["", "secret", 8000], ["postgres://", "a", 48000], ["", "password", 6000], ["", "pwd", 16000], ["", "a.", 24000],
-    ["", "token=a|", 40000], ["", "pwd:", 20000], ["", "token=", 20000], ["", "--token=", 30000], ["", "credential=", 16000],
-    ["", "secret_key:abc_def_ghi|", 5000], ["", "token:", 16000], ["", "DB_PASS=", 20000],
-    [" -u", "=", 60000], [" --user", "=", 60000], [" -u ", "a:", 30000], ["ENV ", "PASS", 15000, " x"]];
-  const text = (share) => SHAPES.map(([pre, unit, n, post = ""]) => pre + unit.repeat(Math.round(n * share)) + post).join("\n");
+  // Each shape on its own: one long line against the same text cut into 16 lines. A linear pattern takes the same
+  // time either way (about 1x); a quadratic one about 16 times as long on the one line, so a shape over 3x fails.
+  // Both sides do the same work, timed in turn, best of five. The clock is CPU time on Linux and macOS, where load on
+  // the machine does not count; on Windows a process's CPU time moves in clock ticks, so there it is wall time. A
+  // shape between 3x and 6x is timed again, twice at most.
+  const SHAPES = [["", "secret", 4000], ["postgres://", "a", 24000], ["", "password", 3000], ["", "pwd", 8000], ["", "a.", 12000],
+    ["", "token=a|", 20000], ["", "pwd:", 10000], ["", "token=", 10000], ["", "--token=", 15000], ["", "credential=", 8000],
+    ["", "secret_key:abc_def_ghi|", 2500], ["", "token:", 8000], ["", "DB_PASS=", 10000],
+    [" -u", "=", 30000], [" --user", "=", 30000], [" -u ", "a:", 15000], ["ENV ", "PASS", 7500, " x"],
+    [" ", "pwd", 8000], ['"', "pwd", 8000]];
+  const clock = process.platform === "win32" ? () => Number(process.hrtime.bigint()) / 1e6
+    : () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
   const ms = (t) => {
-    const start = process.hrtime.bigint();
+    const start = clock();
     scan(t);
-    return Number(process.hrtime.bigint() - start) / 1e6;
+    return clock() - start;
   };
-  const quarter = text(0.25);
-  const full = text(1);
-  ms(quarter); // warm up
-  const q = [];
-  const f = [];
-  for (let i = 0; i < 3; i += 1) {
-    q.push(ms(quarter));
-    f.push(ms(full));
+  const ratio = (one, cut) => {
+    ms(cut); // warm up
+    ms(one);
+    const a = [];
+    const b = [];
+    for (let i = 0; i < 5; i += 1) {
+      b.push(ms(cut));
+      a.push(ms(one));
+    }
+    return Math.min(...a) / Math.max(Math.min(...b), 0.001);
+  };
+  const slow = [];
+  for (const [pre, unit, n, post = ""] of SHAPES) {
+    const k = Math.round(n / 16);
+    const one = pre + unit.repeat(16 * k) + post;
+    const cut = Array.from({ length: 16 }, () => pre + unit.repeat(k) + post).join("\n");
+    let r = ratio(one, cut);
+    for (let again = 0; again < 2 && r >= 3 && r < 6; again += 1) r = Math.min(r, ratio(one, cut));
+    if (r >= 3) slow.push(`${JSON.stringify(pre + unit)} ${r.toFixed(1)}x`);
   }
-  const ratio = Math.min(...f) / Math.min(...q);
-  assert.ok(ratio < 8, `4x the text took ${ratio.toFixed(1)}x the time`);
+  assert.deepEqual(slow, [], "one line took over 3 times as long as the same text cut into 16 lines");
 });
 
 test("this test file is clean to the scanner itself: its fakes are assembled at run time", () => {
@@ -267,7 +285,7 @@ test("an Anthropic key is reported once, not also as an OpenAI key", () => {
   assert.deepEqual(kinds, ["anthropic-key"]);
 });
 
-test("the command line still reports when node keeps the symlink it was started through", { skip: process.platform === "win32" && "symlinks need privileges" }, () => {
+test("the command line still reports when node keeps the symlink it was started through", { skip: symlinkSkip }, () => {
   const dir = mkdtempSync(join(tmpdir(), "payload-scan-link-"));
   try {
     symlinkSync(dirname(SCAN), join(dir, "refs"));
@@ -303,4 +321,123 @@ test("the command line exits 0 when clean, 1 with hits and 2 when it cannot read
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// 0.20.4 B3: a password key word after a space or a quote, the [REDACTED] mask, and a scan that throws
+test("a password key after a space or a quote is caught, as when a *_FILE key comes first on its line", () => {
+  const P = "PASS" + "WORD";
+  const pw = "hunter" + "22xyz"; // letters and digits, 11 characters: only env-password reads it
+  for (const line of [`POSTGRES_${P}_FILE=/run/secrets/pw POSTGRES_${P}=${pw}`, `docker run -e POSTGRES_${P}=${pw} postgres`,
+    `env MYSQL_PWD=${pw} mysql`, `docker run -e "POSTGRES_${P}=${pw}" img`]) {
+    assert.ok(scan(line).count > 0, `not caught: ${line}`);
+  }
+  for (const line of [`f(user=u, pass${"word"}=secret_value)`, `PG${P}=$PGPASS psql`, `POSTGRES_${P}_FILE=/run/secrets/pw`,
+    `DB_${P}=<your-pass${"word"}>`]) {
+    assert.equal(scan(line).count, 0, `caught: ${line}`);
+  }
+});
+
+test("a value masked as SKILL.md says, [REDACTED], is clean to the scanner, so the mask-and-rescan loop ends", () => {
+  const M = "[REDACTED]";
+  for (const line of [`DB_PASS${"WORD"}=${M}`, `docker run -e POSTGRES_PASS${"WORD"}=${M} img`, `--pass${"word"} ${M}`,
+    "curl -u admin" + ":" + M + " https://x", "postgres://admin" + ":" + M + "@db.internal:5432/app"]) {
+    assert.equal(scan(line).count, 0, `caught: ${line}`);
+  }
+});
+
+test("the command line exits 2 and prints no report when the scan itself throws", () => {
+  // A regex that runs out of stack throws a RangeError inside scan; a preload makes one do so on this file's line.
+  const dir = mkdtempSync(join(tmpdir(), "payload-scan-throw-"));
+  try {
+    const file = join(dir, "payload.md");
+    writeFileSync(file, "a line the scan cannot finish\n");
+    const pre = join(dir, "throw.mjs");
+    writeFileSync(pre, ["const real = RegExp.prototype.test;",
+      "RegExp.prototype.test = function (s) {",
+      '  if (String(s).includes("the scan cannot finish")) throw new RangeError("Maximum call stack size exceeded");',
+      "  return real.call(this, s);",
+      "};", ""].join("\n"));
+    const r = spawnSync(process.execPath, ["--import", pathToFileURL(pre).href, SCAN, file], { encoding: "utf8" });
+    assert.equal(r.status, 2, `an exception is no "hits found" (1): ${r.stderr}`);
+    assert.equal(r.stdout, "", "no report that could be read as a result");
+    assert.match(r.stderr, /^payload-scan: cannot scan .*payload\.md: Maximum call stack size exceeded$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 0.20.4 B3 review 1: a value that starts with < or {, and a [REDACTED] glued to the rest of a value
+test("a password value that starts with < or { is still caught; only a whole placeholder is left", () => {
+  const P = "PASS" + "WORD";
+  const v = "Zx9pQ7" + "rTw2";
+  for (const line of [`DB_${P}={${v}`, `export MYSQL_PWD=<${v}`, `+DB_${P}={${v}`, `docker run -e DB_${P}=<${v} img`]) {
+    assert.ok(scan(line).count > 0, `not caught: ${line}`);
+  }
+  // a whole placeholder is no value to env-password (assigned-password still reads a value with a symbol, %X% too)
+  for (const line of [`DB_${P}=<your-pass${"word"}>`, `DB_${P}={{ secret }}`, `DB_${P}=%(pw)s`, `DB_${P}=%DB_PASS%`]) {
+    assert.ok(!scan(line).hits.some((h) => h.kind === "env-password"), `env-password on: ${line}`);
+  }
+});
+
+test("a [REDACTED] glued to the rest of a value is no mask: the rescan still catches what is left", () => {
+  const M = "[REDACTED]";
+  const jwt = ["ey" + "J" + "a".repeat(12), "ey" + "J" + "b".repeat(12), "c".repeat(16)].join(".");
+  for (const line of [`--pass${"word"} ${M}Zx9pQ7rTw2`, `token ${M}${jwt}`]) {
+    assert.ok(scan(line).count > 0, `not caught: ${line}`);
+  }
+  assert.equal(scan(`--pass${"word"} ${M}`).count, 0, "a whole mask is no value");
+});
+
+// 0.20.5: a KEY=value password word right after `=` or `(` is caught as well as after a space or a quote
+// (`kubectl ... --from-literal=DB_PASSWORD=...`, `docker run --env=...`, a subshell). A keyword argument still is not.
+test("a password env word after a space, a quote, ( or = is caught", () => {
+  const P = "PASS" + "WORD";
+  const v = "hunter" + "22";
+  for (const line of [`kubectl create secret generic x --from-literal=DB_${P}=${v}`, `docker run --env=DB_${P}=${v} img`, `(DB_${P}=${v} psql)`]) {
+    assert.ok(scan(line).hits.some((h) => h.kind === "env-pass" + "word"), `not caught: ${line}`);
+  }
+  for (const line of [`f(user=u, pass${"word"}=secret_value)`, `f(pass${"word"}=secret_value)`, `PG${P}=$PGPASS psql`, `const DB_${P}=getPw();`]) {
+    assert.equal(scan(line).count, 0, `caught: ${line}`);
+  }
+});
+
+// 0.20.5: the shell's own working folder (PWD, OLDPWD) holding a path is no password, as in lineage. A key that only
+// ends in PWD, or a PWD whose value is no plain path, still is.
+test("the shell's own PWD and OLDPWD with a path are no password; a key that only ends in PWD still is", () => {
+  const W = "P" + "WD", P = "PASS" + "WORD";
+  for (const line of [`${W}=/home/user/project`, `export OLD${W}=/home/user`, `+${W}=/home/u/p`, `declare -x ${W}="/home/user"`,
+    `"${W}": "/home/user/project",`, `${W}: /home/user/project`, `${W}=~/src`, `${W}=/c/Users/me`, `docker run --rm -v $${W}:/workspace img`]) {
+    assert.equal(scan(line).count, 0, `caught: ${line}`);
+  }
+  const pw = ["/hunter", "22xyz"].join(""), odd = ["/S3cr", "3t!x9"].join("");
+  for (const line of [`MYSQL_${W}=${pw}`, `UID=sa;${W}=${pw}`, `${W}=${odd}`, `ENV DB_${P} ${odd}`]) {
+    assert.ok(scan(line).count > 0, `not caught: ${line}`);
+  }
+});
+
+// Curation N-2: ~/.netrc (one line and its token-a-line layout), ~/.pgpass and docker's config.json "auth" went out
+// with no hit; the nine kinds before them still do.
+test("a .netrc password, a .pgpass line and docker's config.json auth are caught, each in its own file layout", () => {
+  const pw = "pass" + "word";
+  const netrcLines = ["machine git.example.com", "  login bob", `  ${pw} ` + "Netrc-V4lue", "default login anon " + pw + " An0n-V4lue account x"].join("\n");
+  assert.deepEqual(scan(netrcLines).hits.map((h) => [h.line, h.kind]), [[3, "netrc-pass" + "word"], [4, "netrc-pass" + "word"]]);
+  const pgpass = ["# host:port:db:user:" + pw, "localhost:*:*:bob:" + "Pg-V4lue", "+db.internal:6432:app:svc:" + "Pg-0ther", "10.0.0.5:5432:app:bob:" + "Pg\\:c0lon"].join("\n");
+  assert.deepEqual(scan(pgpass).hits.map((h) => [h.line, h.kind]), [[2, "pgpass-line"], [3, "pgpass-line"], [4, "pgpass-line"]], "an escaped colon in the password too");
+  const auth = Buffer.from("svc:" + "Dock3r-V4lue").toString("base64");
+  const docker = ["{", '  "auths": {', '    "ghcr.io": {', `      "au` + `th": "${auth}"`, "    }", "  }", "}"].join("\n");
+  assert.deepEqual(scan(docker).hits.map((h) => [h.line, h.kind]), [[4, "docker-auth"]]);
+});
+
+test("files shaped like a .netrc, a .pgpass or a docker config.json with no secret in them are clean", () => {
+  const pw = "pass" + "word";
+  const text = [
+    "machine git.example.com", "  login bob", "machine h login u", "default login anonymous", `  ${pw}`, `  ${pw} $NETRC_PASS`,
+    `the ${pw} is required here`, `${pw} must be 12 characters or more`,
+    "localhost:5432:*:*:*", "root:x:0:0:root:/root:/bin/bash", "12:30:45", "a:b:c:d:e", "ports: 8080:80",
+    // S11 L10: a MAC of digits, a time with frames, a MAC with a letter in its first group (the password would hold a colon)
+    "+00:11:22:33:44:55", "+12:30:45:00:01", "0a:11:22:33:44:55",
+    '{"auths": {}}', '{"auths": {"ghcr.io": {"au' + 'th": ""}}}', '"credsStore": "desktop"', '"au' + 'th": "none"',
+    '"au' + 'th": "' + Buffer.from("no colon here").toString("base64") + '"',
+  ].join("\n");
+  assert.deepEqual(scan(text), { count: 0, hits: [] });
 });

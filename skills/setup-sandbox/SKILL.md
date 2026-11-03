@@ -31,6 +31,25 @@ git config --global --get-all safe.directory 2>/dev/null
 [ -f ~/.claude/settings.json ] && grep -A3 '"sandbox"' ~/.claude/settings.json
 ```
 
+### 네트워크 확인 (내려받기 전)
+
+이 스킬이 내려받는 원천에 10초 안에 닿는지 먼저 본다. 닿지 않으면 그 원천에서 받는 단계는 하지 않고, 이미 설치된 것의 확인만 한 뒤 "오프라인이라 설치하지 않음(필요한 것: <못 깐 것>)" 으로 보고한다.
+
+```bash
+[ "${CODEX_SANDBOX_NETWORK_DISABLED:-}" = 1 ] && echo "Codex sandbox 가 네트워크를 막음(아래 실패는 오프라인이 아님)"
+curl --ssl-no-revoke -sSI -o /dev/null --connect-timeout 5 --max-time 10 https://sh.rustup.rs   # rust, cargo(4단계)
+```
+
+- `curl -sSI` 는 머리만 받는다(본문을 받지 않음). 닿지 못하면 종료 코드가 0 이 아니다(HTTP 상태와 관계없음). `curl` 은 `HTTPS_PROXY` 를 따른다. 확인 줄은 `--ssl-no-revoke` 를 준다. Windows 의 Git Bash curl 도 Schannel 이라, 폐지 목록 서버에 닿지 못하는 망에서 폐지 확인이 실패하면 종료 60 이다(Windows 박스 실측). 다른 curl 은 이 깃발을 받고 무시한다(macOS curl 8.7.1, Rocky 8.10 curl 7.61.1 실측).
+- Windows PowerShell 에서는 같은 주소를 `curl.exe --ssl-no-revoke -sSI -o NUL --connect-timeout 5 --max-time 10 <주소>` 로 보고 `$LASTEXITCODE` 가 0 인지 본다(PowerShell 5.1 의 `curl` 은 `Invoke-WebRequest` 별칭이다). `curl.exe` 는 Windows 시스템 프록시를 따르지 않고 `HTTPS_PROXY` 만 따른다. `--ssl-no-revoke` 는 폐지 목록 서버에 닿지 못하는 망에서 Schannel 의 폐지 확인 실패를 오프라인으로 읽지 않게 한다. 닿는지만 보고 받은 내용은 쓰지 않으므로 이 확인에만 준다. `curl.exe` 가 없으면 `$LASTEXITCODE` 에 앞 명령의 값이 남으므로 `Get-Command curl.exe -ErrorAction SilentlyContinue` 로 먼저 보고, 없으면 확인하지 못한 것으로 적는다.
+- 사내 미러만 열린 망이면 확인 주소를 그 미러로 바꿔 본다.
+- OS 패키지 관리자(dnf, apt, brew, winget)의 단계는 자기 설정의 미러를 쓰므로 이 확인과 관계없이 시도하고, 실패하면 그 단계를 실패로 보고한다.
+  - 패킷을 버리거나 답하지 않는 망에서 dnf 는 저장소마다 약 2분(SYN 을 버리는 망 실측 121초), apt 는 원천마다 약 4분(답하지 않는 원천 실측 247초) 기다린 뒤 실패로 끝난다. 시간 제한은 관리자 설정을 따르므로 이 스킬이 바꾸지 않는다.
+  - `apt-get update` 는 받지 못해도 종료 0 이다. 출력의 `W: Failed to fetch` 가 있으면 그 단계를 실패로 보고한다.
+- Codex sandbox 가 네트워크를 막는 모드(기본 `workspace-write`, `read-only`)에서는 `CODEX_SANDBOX_NETWORK_DISABLED=1` 이 서고 확인이 모두 실패한다(curl 종료 7, npm `EPERM`). 블록의 첫 줄이 그렇다고 알린다. 그때는 '오프라인' 이 아니라 'sandbox 가 네트워크를 막음' 으로 보고하고, 승인을 받아 sandbox 밖에서 확인부터 다시 한다. Claude Code sandbox 안(`SANDBOX_RUNTIME=1`)에서는 허용 목록 밖 주소를 sandbox 프록시가 막는다. Windows PowerShell 에서는 `$env:CODEX_SANDBOX_NETWORK_DISABLED -eq '1'` 로 본다.
+- 확인이 실패하면 보고에 그 명령, 종료 코드, stderr 첫 줄을 붙인다(예: `npm error code ETIMEDOUT`, `curl: (28) ...`). 원인을 '오프라인' 하나로 짐작하지 않는다.
+- curl 의 종료 60(인증서 검증 실패)도 오프라인이 아니다. 망은 열려 있고, TLS 를 가로채는 사내 프록시의 인증서를 OS 가 믿지 않는 것이다. '인증서 문제로 설치하지 않음' 으로 보고한다.
+
 ## 1. Linux - bubblewrap + socat + userns sysctl
 ### Rocky Linux 8 / RHEL8
 ```bash
@@ -87,7 +106,12 @@ command -v sandbox-exec >/dev/null && echo "Seatbelt 내장 OK"
 
 ## 4. 폴드인 - rust/cargo
 ```bash
-command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+command -v cargo >/dev/null || {
+  T=$(mktemp -d)
+  curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 10 --max-time 120 -o "$T/rustup-init.sh" https://sh.rustup.rs \
+    && sh "$T/rustup-init.sh" -y                    # 받았을 때만 실행
+  rm -rf "$T"
+}
 source "$HOME/.cargo/env" 2>/dev/null
 cargo --version
 ```
@@ -123,12 +147,12 @@ Claude Code 의 Bash 도구 샌드박스는 `~/.claude/settings.json` 의 `sandb
 흔하므로(예: `docs-setup` 이 다루는 것과 같은 함정) 먼저 3.11+ 인터프리터를 고른다:
 ```bash
 PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"
-"$PY" -c "import tomllib" 2>/dev/null || echo "⚠ tomllib 없음 - Python 3.11+ 설치 후 재시도(setup-python 참고)"
+(cd ~ && "$PY" -c "import tomllib") 2>/dev/null || echo "⚠ tomllib 없음 - Python 3.11+ 설치 후 재시도(setup-python 참고)"   # 홈에서: -c, -m, 표준 입력 스크립트는 지금 폴더의 모듈을 먼저 불러온다
 ```
 그 `$PY` 로 패치한다. `sandbox_mode` 치환은 **첫 `[` 테이블 헤더 이전(root 영역)만** 대상으로 삼아
 `[profiles.*]` 하위의 같은 이름 override(예: 프로필별 `read-only` 강제)를 절대 건드리지 않는다(멱등):
 ```bash
-"$PY" <<'EOF'
+(cd ~ && "$PY" <<'EOF'   # 홈에서: 표준 입력 스크립트는 지금 폴더의 모듈을 먼저 불러온다
 import re
 from pathlib import Path
 import tomllib
@@ -157,6 +181,7 @@ tomllib.loads(text)  # 패치 후 재검증
 CFG.write_text(text, encoding="utf-8")
 print("✓ sandbox_mode=workspace-write, network_access=true")
 EOF
+)
 ```
 
 ## 검증 (보고 의무)
@@ -170,10 +195,10 @@ git config --global --get-all safe.directory
 
 grep -n 'sandbox_mode\|network_access' ~/.codex/config.toml
 PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"   # tomllib=3.11+
-"$PY" -c "import tomllib; tomllib.loads(open('$HOME/.codex/config.toml', encoding='utf-8').read()); print('✓ TOML 유효')"
+(cd ~ && "$PY" -c "import tomllib; tomllib.loads(open('$HOME/.codex/config.toml', encoding='utf-8').read()); print('✓ TOML 유효')")
 timeout 30 codex sandbox -- echo sandbox-ok    # Codex 자체 샌드박스 러너로 실제 실행 확인
 
-python3 -m json.tool ~/.claude/settings.json >/dev/null && echo "settings.json 유효"
+(cd ~ && python3 -m json.tool ~/.claude/settings.json) >/dev/null && echo "settings.json 유효"
 # Claude Code sandbox 설정은 settings.json 로 확인(위 json.tool). 실제 동작은 세션에서 Bash 도구 실행으로 관찰
 ```
 4-field 보고: 변경(설치 패키지·sysctl 파일·config.toml/settings.json 변경분) / Evidence(위 출력) /

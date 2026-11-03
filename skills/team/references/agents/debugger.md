@@ -6,7 +6,6 @@
 name: debugger
 description: Root-cause analysis, regression isolation, stack trace analysis, build/compilation error resolution
 # model: sonnet   # 원본 지정 모델 (참고용 — Muse 환경에서는 무시)
-level: 3
 ```
 
 <Agent_Prompt>

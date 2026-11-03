@@ -1,7 +1,7 @@
 ---
 name: ultra-init
-description: "아이디어·러프 브리프·그린필드를 계획→구현→QA 통과까지 핸즈오프 1회 자율 실행하는 풀사이클 오케스트레이터. 사용자가 'ultra-init', '알아서 만들어줘', '핸즈오프 빌드'라고 요청하면 사용."
-argument-hint: "[--short|--deliberate] [--gated] [--qa tests,build,lint,typecheck] [--critic=architect|critic|codex] [--plan-id <id>] <브리프 / 만들 것>"
+description: "아이디어·러프 브리프·그린필드를 계획→구현→ralph-qa QA 통과까지 핸즈오프 1회 자율 실행하는 풀사이클 오케스트레이터. 사용자가 'ultra-init', '알아서 만들어줘', '핸즈오프 빌드'라고 요청하면 사용."
+argument-hint: "[--short|--deliberate] [--gated] [--qa tests,build,lint,typecheck,scenarios] [--critic=architect|critic|codex] [--plan-id <id>] <브리프 / 만들 것>"
 ---
 
 # ultra-init: 자율 풀사이클 오케스트레이터
@@ -13,7 +13,7 @@ argument-hint: "[--short|--deliberate] [--gated] [--qa tests,build,lint,typechec
 번들 파이프라인(실행 순서):
 
 ```
-ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
+ralplan --deliberate  →  ultragoal  →  ralph  →  ralph-qa  →  complete
 계획(합의)               목표 원장      영속 실행            QA 순환      완료/정리
 ```
 
@@ -31,7 +31,7 @@ ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
 
 1. Phase 3에서는 ralph가 유일한 루프 권위다. 끝까지 돌게 둔다.
 2. ultragoal은 `artifact_only` 모드로 — 내구 계획 + 원장 + 증거만. ralph 실행 중 경쟁하는 목표 루프를 만들지 않는다.
-3. ultraqa는 ralph 완료 후 Phase 4에서만, 터미널 QA 서브게이트로. ralph와 동시 실행 금지.
+3. ralph-qa는 ralph 완료 후 Phase 4에서만, 터미널 QA 서브게이트로. ralph와 동시 실행 금지.
 4. ultrawork는 별도 페이즈가 아니다. ralph 내부 병렬 엔진으로 취급한다.
 
 ## Workflow
@@ -40,7 +40,7 @@ ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
 
 - 인자에서 브리프를 resolve한다. 비어 있으면 한 번만 묻고 진행한다.
 - 플래그 파싱: `--deliberate`(기본)/`--short`(가벼운 계획), `--gated`, `--qa <dims>`, `--critic=...`, `--plan-id <id>`.
-- 서브 스킬 확인: 번들된 스킬(ralplan·ralph·ultraqa·ultragoal·cancel 등)은 `~/workspace/skills/<name>/`에 이식된 것만 호출한다. 미이식 스킬이 있으면 해당 페이즈를 degraded 모드로(계획은 `plan.md` 기록, 추적은 세션 스코프) 돌리고 보고에 명시한다.
+- 서브 스킬 확인: 번들된 스킬(ralplan·ralph·ralph-qa·ultragoal·cancel 등)은 `~/workspace/skills/<name>/`에 이식된 것만 호출한다. 미이식 스킬이 있으면 해당 페이즈를 degraded 모드로(계획은 `plan.md` 기록, 추적은 세션 스코프) 돌리고 보고에 명시한다.
 
 ### Phase 1 — PLAN: ralplan --deliberate
 
@@ -66,15 +66,15 @@ ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
 - ralph가 story-by-story로 전부 `passes: true`가 될 때까지 반복 → reviewer 검증 → deslop → post-deslop 회귀 재검증. ralph가 이 페이즈의 루프 권위.
 - "계속 진행" 신호가 와도 중단하지 않는다. 끝까지 돌게 둔다.
 
-### Phase 4 — QA GATE: ultraqa
+### Phase 4 — QA GATE: ralph-qa
 
-- ralph 완료 후 터미널 크로스차원 QA 게이트. 기본 순서 `typecheck → lint → build → tests`, 또는 `--qa` 목록.
+- ralph 완료 후 터미널 크로스차원 QA 게이트. 기본 순서 `typecheck → lint → build → tests`, 또는 `--qa` 목록(`scenarios`를 넣으면 적대적 시나리오 행 추가). ralph-qa가 순환을 소유한다. ultra-init은 별도 QA 순환을 두지 않는다. 기준선(Phase 1.5 기록)은 ralph-qa의 반복 0 기준선으로 넘기고, 변경 뒤 트리에서 반복 0을 다시 돌리지 않는다.
 - 각 차원은 최대 5회 순환: RUN QA → diagnose → fix → 반복. 같은 실패가 3회 반복되면 조기 종료.
 
 ### Phase 5 — COMPLETE
 
 - 최종 체크포인트: quality-gate 증거와 함께 완료 기록. 게이트가 하나라도 clean이 아니면 complete 표시 금지 — blocker를 기록하고 Phase 3로 돌아간다.
-- 전부 완료 확인 → ralph/ultraqa/mode 상태 정리(`cancel` 상당).
+- 전부 완료 확인 → ralph/ralph-qa/mode 상태 정리(`cancel` 상당).
 - 간결하고 증거 기반의 최종 요약: 계획 내용, 전달된 story, 수정된 파일, reviewer 판정, deslop 결과, 차원별 QA 결과, 원장 위치.
 
 ## Stop Conditions
@@ -84,6 +84,7 @@ ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
 - 사용자 입력이 필요한 하드 블로커(자격증명 누락, 외부 서비스 다운, 스코핑으로 해결 안 되는 진짜 모호한 요구사항).
 - 사용자가 stop/cancel/abort → 상태 정리 후 중단.
 - 같은 실패가 **3회** 반복 → 근본 문제 가능성으로 surface.
+- ralph-qa가 `ITERATE`(한도 소진)나 `INCONCLUSIVE`로 끝나면 판정 줄과 blocker를 보고하고 게이트 통과로 적지 않는다.
 - ralplan이 합의에 도달 못 하면(최대 5회) → 최선의 계획을 제시하고 진행 여부를 묻는다.
 
 그 외: 멈추지 않고, 페이즈 사이에서 허락을 묻지 않는다.
@@ -93,11 +94,11 @@ ralplan --deliberate  →  ultragoal  →  ralph  →  ultraqa  →  complete
 - [ ] Phase 1: 합의 승인된 계획(ADR, 순서 있는 story, 테스트 가능한 acceptance criteria, 확장 테스트 계획)
 - [ ] Phase 2: ultragoal 원장 등록(또는 degraded `plan.md`)
 - [ ] Phase 3: 모든 story `passes: true`, reviewer 검증, deslop, post-deslop 회귀 green
-- [ ] Phase 4: 대상 차원 전부 ultraqa green
+- [ ] Phase 4: 대상 차원 전부 ralph-qa `APPROVE` (scenarios를 넣었으면 그 행 포함)
 - [ ] Phase 5: 최종 체크포인트(clean quality-gate 증거), 상태 정리, 증거 기반 최종 요약("should"/"looks good" 금지 — 실제 명령 출력 제시)
 
 ## Operating Rules
 
 - Thin-orchestrator 규칙: 항상 실제 스킬/CLI를 호출한다. 내부를 복제하지 않는다.
-- 오버라이드 요약: `--short`(가벼운 ralplan), `--gated`(계획 후 승인 대기), `--qa tests,build`(QA 차원 제한), `--critic=...`(ralph reviewer), `--plan-id <id>`(병렬 실행용 안정 원장 id).
+- 오버라이드 요약: `--short`(가벼운 ralplan), `--gated`(계획 후 승인 대기), `--qa tests,build`(QA 차원 제한; `scenarios` 추가 가능), `--critic=...`(ralph reviewer), `--plan-id <id>`(병렬 실행용 안정 원장 id).
 - 한계: 원본의 `omc` CLI·`Skill("oh-my-claudecode:<name>")`·`Task(subagent_type=...)` 메커니즘은 Claude Code 전용이다. 이 환경에서는 `~/workspace/skills/`에 이식된 동명 스킬을 호출하고, 장기 실행·병렬 위임이 필요하면 `subagent.spawn` 또는 background exec + process 도구를 쓴다. `omc` CLI가 없으면 Phase 2는 degraded 모드(`plan.md` 기록)로 명시한다. 서브 스킬 미이식은 조용히 건너뛰지 않고 보고에 명시한다.

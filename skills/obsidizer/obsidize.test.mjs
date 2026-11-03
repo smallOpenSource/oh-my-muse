@@ -5,9 +5,11 @@
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   norm, detectProfile, parseFrontmatter, serializeFrontmatter, parseOmcFrontmatter,
@@ -604,4 +606,88 @@ test('serializeFrontmatter emits exactly the 9 keys in OMC order', () => {
   const yaml = serializeFrontmatter(fm);
   assert.deepEqual(yaml.split('\n').map((l) => l.slice(0, l.indexOf(':'))), FM_KEYS);
   assert.ok(yaml.includes('tags: ["a", "b"]'), 'FLOW arrays, double-quoted — OMC parseYamlArray reads flow form only');
+});
+
+// Node resolves links for import.meta.url but not for process.argv[1]; comparing the two as given made
+// a run through a linked folder exit 0 without doing anything. The link is a folder junction on
+// Windows, where a file symlink needs admin rights; elsewhere 'junction' is ignored. It sits in a
+// folder of its own, not one of the vaults, and is removed on its own: no recursive delete meets it.
+test('obsidize answers the same through a linked folder as through its own path', (t) => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'obz-link-'));
+  const link = path.join(linkDir, 'linked');
+  try {
+    fs.symlinkSync(here, link, 'junction');
+  } catch {
+    fs.rmdirSync(linkDir);
+    t.skip('links cannot be made here');
+    return;
+  }
+  try {
+    for (const d of [here, link]) {
+      const r = spawnSync(process.execPath, [path.join(d, 'obsidize.mjs')], { encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 2, `${d}: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`);
+      assert.match(r.stderr, /^usage: obsidize\.mjs /m, d);
+    }
+  } finally {
+    fs.unlinkSync(link);
+    fs.rmdirSync(linkDir);
+  }
+});
+
+// 0.20.5 (final batch deferred row 8): a file system that does not flush on request (fsync says EINVAL or ENOTSUP) still
+// gets each page whole by the rename, as the 3d-intro key files do. Any other fsync error still stops the run, the page as it was.
+test('write path: a file system whose fsync says EINVAL or ENOTSUP still gets the page whole; another fsync error stops it, the page as it was', (t) => {
+  for (const code of ['EINVAL', 'ENOTSUP', 'EIO']) {
+    const dir = makeVault({ 'index.md': '# I\n', 'log.md': '# L\n', 'p-one.md': omcPage({ tags: ['#x'] }) });
+    const file = path.join(dir, 'p-one.md');
+    const before = fs.readFileSync(file, 'utf8');
+    const fsync = t.mock.method(fs, 'fsyncSync', () => { throw Object.assign(new Error(`${code}: fsync`), { code }); });
+    if (code === 'EIO') {
+      assert.throws(() => run(dir, { profile: 'omc', now: NOW }), (e) => e.code === 'EIO');
+      assert.equal(fs.readFileSync(file, 'utf8'), before, 'EIO: the page as it was');
+    } else {
+      const report = run(dir, { profile: 'omc', now: NOW });
+      assert.deepEqual(report.changed, ['p-one.md'], code);
+      assert.notEqual(fs.readFileSync(file, 'utf8'), before, `${code}: the page was normalized`);
+    }
+    fsync.mock.restore();
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => f.includes('.obsidizer.tmp')), [], `${code}: no temp file stays`);
+  }
+});
+
+test('--page: only a plain page is rewritten, a link or a hard link in its place is refused, not followed', (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'obsidize-page-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const vault = path.join(tmp, 'omx_wiki');
+  const outside = path.join(tmp, 'outside');
+  fs.mkdirSync(vault);
+  fs.mkdirSync(outside);
+  const page = '---\ntitle: "P"\ntags: ["#P"]\n---\n\n# P\n\nx\n';
+  fs.writeFileSync(path.join(outside, 'victim.md'), page);
+  fs.writeFileSync(path.join(vault, 'own.md'), page);
+  assert.equal(run(path.join(vault, 'own.md'), { profile: 'generic', page: true, now: NOW }).changed.length, 1);
+  fs.linkSync(path.join(outside, 'victim.md'), path.join(vault, 'hard.md'));
+  assert.throws(() => run(path.join(vault, 'hard.md'), { profile: 'generic', page: true }), /not a plain page/);
+  try {
+    fs.symlinkSync(path.join(outside, 'victim.md'), path.join(vault, 'soft.md'));
+  } catch {
+    return t.skip('no file links');
+  }
+  assert.throws(() => run(path.join(vault, 'soft.md'), { profile: 'generic', page: true }), /not a plain page/);
+  assert.equal(fs.readFileSync(path.join(outside, 'victim.md'), 'utf8'), page);
+  const pages = buildVaultModel(vault, true).pages;
+  assert.ok(pages.has('own.md') && !pages.has('soft.md') && !pages.has('hard.md'), 'the vault model reads plain pages only');
+});
+
+test('--page refuses a path instead of a bare name, and a cwd that is not the vault folder it was given', (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'obsidize-vault-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(tmp, 'p.md'), '# P\n');
+  const st = fs.statSync(tmp, { bigint: true });
+  const cli = (args) => spawnSync(process.execPath, [fileURLToPath(new URL('./obsidize.mjs', import.meta.url)), ...args], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(cli(['p.md', '--page', `--vault=${st.dev}:${st.ino}`, '--profile=generic', '--json']).status, 0);
+  assert.equal(cli([path.join(tmp, 'p.md'), '--page', `--vault=${st.dev}:${st.ino}`]).status, 2);
+  assert.equal(cli(['p.md', '--page', '--vault=1:2']).status, 2);
+  assert.equal(cli(['p.md', '--page']).status, 2);
 });

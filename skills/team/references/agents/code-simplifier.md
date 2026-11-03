@@ -6,7 +6,7 @@
 - name: `code-simplifier`
 - description: Simplifies and refines code for clarity, consistency, and maintainability while preserving all functionality. Focuses on recently modified code unless instructed otherwise.
 - model: `opus` → Muse 환경에서는 적용되지 않음 (모델 지정 없이 역할 프롬프트만 사용)
-- level: 3 → 참고용 우선순위 수준, Muse 환경에서는 일반화
+- level: (업스트림 v5.7.31에서 제거됨; 기존 값 3은 참고용 우선순위 수준이었음, Muse 환경에서는 일반화)
 - 도구 선언 없음 → 아래 Constraints에 따라 파일 수정 도구는 사용하나, 동작 변경 없이 구조적 단순화에만 제한
 
 <Agent_Prompt>

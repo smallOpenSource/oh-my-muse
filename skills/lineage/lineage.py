@@ -4,13 +4,16 @@
 Deterministic core. One-line summary per assistant turn (cached, redacted).
 Renders assistant markdown, filters harness noise, folds long messages, and
 self-verifies the output markup. See SKILL.md for the full design and the
-`work/lineage-change-request.html` spec for the classification rules.
+`docs/lineage-change-request.html` spec for the classification rules.
 
 Runtime-agnostic: works from any transcript via --session / --from-transcript.
 Auto-discovery assumes Claude Code's ~/.claude/projects/<encoded-cwd>/ layout.
 """
+
 import argparse
+import bisect
 import hashlib
+import heapq
 import hmac
 import html
 import json
@@ -18,47 +21,68 @@ import math
 import os
 import pathlib
 import re
+import stat
 import sys
 import tempfile
+import unicodedata
+from array import array
 from html.parser import HTMLParser
+from typing import Any
 
 if sys.version_info < (3, 7):
-    sys.stderr.write("lineage requires Python 3.7+ (found %s)\n"
-                     % sys.version.split()[0])
+    sys.stderr.write(
+        "lineage requires Python 3.7+ (found %s)\n" % sys.version.split()[0]
+    )
     sys.exit(2)
 
-SCHEMA_VERSION = 2          # cache dir schema (v2: redacted summaries only)
-SUMMARIZER_VERSION = 3      # bump when summarize_turn logic changes (B-3 cache key); 3: cut from redacted text
-USER_FOLD = 400             # collapse user messages longer than this (E-1)
-ECHO_ASK = 40               # echo-exchange: user question length ceiling (A-4)
-ECHO_REPLY = 5              # echo-exchange: assistant reply length ceiling (A-4)
+SCHEMA_VERSION = 2  # cache dir schema (v2: redacted summaries only)
+SUMMARIZER_VERSION = (
+    4  # bump when summarize_turn or the page redaction changes (B-3 cache key)
+)
+# 3: cut from redacted text (3.0.2); 4: split secrets joined first (3.0.8)
+USER_FOLD = 400  # collapse user messages longer than this (E-1)
+ECHO_ASK = 40  # echo-exchange: user question length ceiling (A-4)
+ECHO_REPLY = 5  # echo-exchange: assistant reply length ceiling (A-4)
 _BLOCKQUOTE_MAX_DEPTH = 32  # blockquote recursion cap (C-2)
 CACHE_BASE = pathlib.Path.home() / ".cache" / "lineage"
-REVIEW_SCHEMA = "lineage-review/2"       # --emit-review pack, read back by --apply-review; 2: llm_key, pages redacted (3.0.2)
+REVIEW_SCHEMA = "lineage-review/2"  # --emit-review pack, read back by --apply-review; 2: llm_key, pages redacted (3.0.2)
 REVIEW_PART_SCHEMA = "lineage-review-part/1"
-REVIEW_PART = 40            # turns per part file: one reviewer's share
-PREVIEW_HEAD = 1500         # a long turn's preview: head + tail, where conclusions sit
+REVIEW_PART = 40  # turns per part file: one reviewer's share
+PREVIEW_HEAD = 1500  # a long turn's preview: head + tail, where conclusions sit
 PREVIEW_TAIL = 700
-SUMMARY_MAX = 120           # a reviewer's summary is cut to this, after redaction
-LLM_CACHE_VERSION = 1       # bump to drop every cached reviewer decision
-REVIEWER_TIMEOUT = 60       # --reviewer-timeout default, seconds
-DECISIONS_MAX = 1_000_000   # bytes in one decisions file (a 40-turn part answers in some 20 KB)
-DECISIONS_TRIES = 200       # places a wrapped answer's list may start, tried at most
+SUMMARY_MAX = 120  # a reviewer's summary is cut to this, after redaction
+LLM_CACHE_VERSION = 1  # bump to drop every cached reviewer decision
+REVIEWER_TIMEOUT = 60  # --reviewer-timeout default, seconds
+DECISIONS_MAX = (
+    1_000_000  # bytes in one decisions file (a 40-turn part answers in some 20 KB)
+)
+DECISIONS_TRIES = 200  # places a wrapped answer's list may start, tried at most
 
 # ---------------------------------------------------------------- Noise / classify
 # NOTE: JSONL records carry RAW `<...>` tags. Every regex below uses raw `<`/`>`
 # (NOT the HTML-escaped `&lt;` seen in the display-only change-request document).
-_NOISE_TAGS = ("system-reminder", "local-command-caveat", "local-command-stdout",
-               "local-command-stderr", "teammate-message", "command-message",
-               "command-args", "command-name", "task-notification")
+_NOISE_TAGS = (
+    "system-reminder",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
+    "teammate-message",
+    "command-message",
+    "command-args",
+    "command-name",
+    "task-notification",
+)
 _NOISE_BLOCK_RE = re.compile(r"<(%s)\b[^>]*>.*?</\1>" % "|".join(_NOISE_TAGS), re.S)
 _NOISE_CLOSE_RE = re.compile(r"</(%s)>" % "|".join(_NOISE_TAGS))
-_NOISE_OPEN_RE = re.compile(r"<(?:%s)\b" % "|".join(_NOISE_TAGS))   # leading orphan open (R7)
+_NOISE_OPEN_RE = re.compile(
+    r"<(?:%s)\b" % "|".join(_NOISE_TAGS)
+)  # leading orphan open (R7)
 
 _SKILL_BODY_RE = re.compile(r"^\s*Base directory for this skill:")
 _WORKFLOW_BODY_RE = re.compile(r'^\s*Run the "[^"\n]+" workflow\.')
 _COMPACTION_RE = re.compile(
-    r"^\s*This session is being continued from a previous conversation")
+    r"^\s*This session is being continued from a previous conversation"
+)
 _HOOK_FEEDBACK_RE = re.compile(r"^\s*Stop hook feedback:")
 _INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted")
 _IMAGE_NOTE_RE = re.compile(r"^\s*\[Image:\s*original\s+\d+x\d+")
@@ -67,18 +91,48 @@ _SYS_ERROR_RE = re.compile(r"^\s*(?:Login expired|Please run /login|API Error)")
 # Manipulation commands: judged by NAME, not by "has no args" (A-4). Plugin
 # commands (name contains ':') are never manipulation — always preserved.
 _HARNESS_CMDS = {
-    "agents", "bug", "clear", "compact", "config", "context", "copy", "cost",
-    "doctor", "effort", "exit", "export", "help", "hooks", "ide",
-    "install-github-app", "login", "logout", "mcp", "memory",
-    "migrate-installer", "model", "output-style", "permissions",
-    "privacy-settings", "quit", "release-notes", "resume", "status",
-    "statusline", "terminal-setup", "todos", "upgrade", "usage", "vim",
+    "agents",
+    "bug",
+    "clear",
+    "compact",
+    "config",
+    "context",
+    "copy",
+    "cost",
+    "doctor",
+    "effort",
+    "exit",
+    "export",
+    "help",
+    "hooks",
+    "ide",
+    "install-github-app",
+    "login",
+    "logout",
+    "mcp",
+    "memory",
+    "migrate-installer",
+    "model",
+    "output-style",
+    "permissions",
+    "privacy-settings",
+    "quit",
+    "release-notes",
+    "resume",
+    "status",
+    "statusline",
+    "terminal-setup",
+    "todos",
+    "upgrade",
+    "usage",
+    "vim",
 }
 # Deliberately NOT in the set: /add-dir (changes readable dirs), /init (writes
 # CLAUDE.md) — these do real work and are kept.
 
 _AGENT_WRAP_RE = re.compile(
-    r"<(agent-message|teammate-message)\b([^>]*)>(.*?)</\1>", re.S)
+    r"<(agent-message|teammate-message)\b([^>]*)>(.*?)</\1>", re.S
+)
 _AGENT_FROM_RE = re.compile(r'(?:from|teammate_id)="([^"]+)"')
 _PEER_LEAD_RE = re.compile(r"^\s*Another Claude session sent a message:\s*")
 _BARE_CMD_RE = re.compile(r"^/([\w-]+)\s*$")
@@ -98,7 +152,7 @@ def clean_user_text(text, drop_harness=True):
     """
     out = _NOISE_CLOSE_RE.sub("", _NOISE_BLOCK_RE.sub("", text)).strip()
 
-    mb = _BARE_CMD_RE.match(out)                 # bare `/name` with no wrapper
+    mb = _BARE_CMD_RE.match(out)  # bare `/name` with no wrapper
     if mb and drop_harness and mb.group(1) in _HARNESS_CMDS:
         return ""
 
@@ -133,7 +187,7 @@ def split_agent_message(text):
         return None, None
     who = _AGENT_FROM_RE.search(m.group(2) or "")
     body = m.group(3).strip()
-    if body.startswith('{"type"'):               # idle/status notification
+    if body.startswith('{"type"'):  # idle/status notification
         return (who.group(1) if who else "agent"), ""
     return (who.group(1) if who else "agent"), body
 
@@ -145,10 +199,18 @@ SECRET_PATTERNS = [
     ("GitHubPAT", re.compile(r"gh[posru]_[A-Za-z0-9]{36}")),
     ("Slack", re.compile(r"xox[bpars]-[A-Za-z0-9-]{10,}")),
     ("JWT", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
-    ("PrivateKey", re.compile(
-        r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----")),
-    ("Password", re.compile(
-        r"(?i)(?:password|암호|비번|패스워드)\s*[:=]\s*['\"]([^'\"\n]{4,})['\"]")),
+    (
+        "PrivateKey",
+        re.compile(
+            r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"
+        ),
+    ),
+    (
+        "Password",
+        re.compile(
+            r"(?i)(?:password|암호|비번|패스워드)\s*[:=]\s*['\"]([^'\"\n]{4,})['\"]"
+        ),
+    ),
 ]
 ENTROPY_LONG = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
@@ -167,15 +229,237 @@ def _mask(s: str) -> str:
     return (s[:4] + "****" + s[-4:]) if len(s) > 8 else "[REDACTED]"
 
 
-def redact(text: str, extra: "str | None" = None, mode: str = "full"):
-    """Multi-layer redaction. Returns (redacted_text, count_by_kind)."""
-    counts = {}
-    out = text
+class _Trail:
+    """Where each character of a text that redaction rewrites stood in the text it started as (-1 for one a marker
+    or a mask put in). A text whose split secrets were joined first is kept only if it shows no character that the
+    one pass over the text as it stands (3.0.7) hid (3.0.8)."""
+
+    def __init__(self, n):
+        self.n, self.pos = n, None  # None: each character is where it was
+
+    def carry(self, edits):
+        """Follow `edits` (start, end, replacement), sorted and apart: an empty replacement drops what it covers, a
+        mask keeps where its first and last four characters were, a marker is all new."""
+        if not edits:
+            return
+        pos = array("q", range(self.n)) if self.pos is None else self.pos
+        out, at, new = array("q"), 0, array("q", [-1])
+        for s, e, r in edits:
+            out += pos[at:s]
+            if r.startswith("[REDACTED"):
+                out += new * len(r)
+            elif r:
+                out += pos[s : s + 4] + new * (len(r) - 8) + pos[e - 4 : e]
+            at = e
+        self.pos = out + pos[at:]
+
+    def sub(self, pat, repl, text):
+        """pat.sub(repl, text), the trail following what it replaced."""
+        edits = []
+
+        def noted(m):
+            r = repl(m)
+            if r != m.group(0):
+                edits.append((m.start(), m.end(), r))
+            return r
+
+        out = pat.sub(noted, text)
+        self.carry(edits)
+        return out
+
+    def shown(self):
+        """A byte for each character of the text it started as: 1 where the text it follows shows that character."""
+        if self.pos is None:
+            return bytearray(b"\x01") * self.n
+        seen = bytearray(self.n)
+        for p in self.pos:
+            if p >= 0:
+                seen[p] = 1
+        return seen
+
+
+def _plain_sub(pat, repl, text):
+    return pat.sub(repl, text)
+
+
+def _sub_for(trail):
+    """The substitution a redaction layer makes its replacements with: kept on `trail` when there is one."""
+    return _plain_sub if trail is None else trail.sub
+
+
+def _shows_more(trail, shown):
+    """Whether the text `trail` follows shows a character of the text it started as that `shown` (a _Trail.shown of
+    another text from the same start) has hidden."""
+    return (
+        int.from_bytes(trail.shown(), "little") & ~int.from_bytes(shown, "little")
+    ) != 0
+
+
+# Characters that cut a value for the patterns while no person reads them as a separator: Unicode's default-ignorable
+# code points (the zero-width space and joiners, the soft hyphen, the direction controls, the variation selectors,
+# the tag characters, the Hangul fillers) and the other format characters, the controls and spaces that are no
+# space, tab or line break, private use, the braille blank, and U+FFFC and U+FFFD, which stand for something lost
+# (a lone surrogate became U+FFFD). A value cut by them is put back together where a pattern finds it once they
+# are gone (3.0.8).
+_SPLITTER_RANGES = (
+    (0x0000, 0x0008),
+    (0x000E, 0x001B),
+    (0x007F, 0x0084),
+    (0x0086, 0x009F),
+    (0x00A0, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x115F, 0x1160),
+    (0x1680, 0x1680),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2000, 0x200F),
+    (0x202A, 0x202F),
+    (0x205F, 0x206F),
+    (0x2800, 0x2800),
+    (0x3000, 0x3000),
+    (0x3164, 0x3164),
+    (0xE000, 0xF8FF),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFD),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+    (0xF0000, 0xFFFFD),
+    (0x100000, 0x10FFFD),
+)
+_SPLITTERS = "".join(
+    chr(a) if a == b else chr(a) + "-" + chr(b) for a, b in _SPLITTER_RANGES
+)
+_SPLITTER_RE = re.compile("[" + _SPLITTERS + "]")
+_UNSPLIT_RE = re.compile("[^" + _SPLITTERS + "]+")
+# A character a value can hold: past a splitter next to a found value, one of these means another value begins.
+_VALUE_CHAR_RE = re.compile(r"[A-Za-z0-9_+/=.\-]")
+
+
+def _unsplit_runs(text):
+    """`text` without its splitters, and where each run of other characters starts in it and in `text`."""
+    firsts, origins, parts, at = array("q"), array("q"), [], 0
+    for m in _UNSPLIT_RE.finditer(text):
+        firsts.append(at)
+        origins.append(m.start())
+        parts.append(m.group(0))
+        at += m.end() - m.start()
+    return "".join(parts), firsts, origins
+
+
+def _matches(text, patterns, entropy):
+    """The matches of `patterns` in `text`, and with `entropy` the runs the entropy rule hides."""
+    found = [m for pat in patterns for m in pat.finditer(text)]
+    if entropy:
+        found += [
+            m for m in ENTROPY_LONG.finditer(text) if shannon_entropy(m.group(0)) >= 4.5
+        ]
+    return found
+
+
+def _cut_spans(text, joined, firsts, origins, matches):
+    """Where in `text` the values `matches` found in `joined` lie, for those splitters cut or touch. A stretch takes
+    in the splitters next to its value when the character past them is no value character (so the value's
+    neighbours are those it had in `joined`); a splitter between the value and another value stays."""
+
+    def at(j):  # where joined[j] is in text
+        k = bisect.bisect_right(firsts, j) - 1
+        return origins[k] + j - firsts[k]
+
+    spans = []
+    for m in matches:
+        s, e = at(m.start()), at(m.end() - 1) + 1
+        before = at(m.start() - 1) + 1 if m.start() else 0
+        after = at(m.end()) if m.end() < len(joined) else len(text)
+        if before == 0 or not _VALUE_CHAR_RE.match(text[before - 1]):
+            s = before
+        if after == len(text) or not _VALUE_CHAR_RE.match(text[after]):
+            e = after
+        if e - s > m.end() - m.start():
+            spans.append((s, e))
+    return spans
+
+
+def _kept(spans, plain):
+    """The stretches of `spans` to join: those no value the patterns find in the text as it stands holds already,
+    and that cut none of those values in two. Joining across such a value would glue it to its neighbour, so the
+    neighbour's own pattern (a lookbehind, a keyword the greedy class ate) no longer finds it. Both lists are swept
+    in order with a heap of the values still open, so many of them stay fast."""
+    plain, out, heap, at = sorted(plain), [], [], 0
+    for s, e in sorted(spans):
+        while at < len(plain) and plain[at][0] < e:
+            heapq.heappush(heap, (plain[at][1], plain[at][0]))
+            at += 1
+        while heap and heap[0][0] <= s:
+            heapq.heappop(heap)
+        if not any(
+            (o_s <= s and e <= o_e) or not (s <= o_s and o_e <= e) for o_e, o_s in heap
+        ):
+            out.append((s, e))
+    return out
+
+
+def _merged(spans):
+    """Sorted stretches with those that overlap or touch put together."""
+    out = []
+    for s, e in spans:
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _rejoin_split(text, patterns, entropy=False, trail=None):
+    """`text` with the splitters taken out of each stretch where, once they are gone, one of `patterns` (and with
+    `entropy` the entropy rule) finds a value that the text as it stands does not show whole: the layers after
+    then see that value and hide it. The rest of the text is left as it is (3.0.8). `trail` follows what is taken out."""
+    if not _SPLITTER_RE.search(text):
+        return text
+    joined, firsts, origins = _unsplit_runs(text)
+    spans = _cut_spans(
+        text, joined, firsts, origins, _matches(joined, patterns, entropy)
+    )
+    if spans:
+        spans = _kept(
+            spans, [(m.start(), m.end()) for m in _matches(text, patterns, entropy)]
+        )
+    drops = [
+        (m.start(), m.end(), "")
+        for s, e in _merged(sorted(spans))
+        for m in _SPLITTER_RE.finditer(text, s, e)
+    ]
+    if trail is not None:
+        trail.carry(drops)
+    out, at = [], 0
+    for s, e, _ in drops:
+        out.append(text[at:s])
+        at = e
+    return "".join(out) + text[at:]
+
+
+def _hide_patterns(out, mode, sub, counts):
+    """`out` with each value the page patterns and the entropy rule find replaced by its marker, or by a mask with
+    mode mask; `counts` adds them up by name."""
     for name, pat in SECRET_PATTERNS:
+
         def repl(m, n=name):
             counts[n] = counts.get(n, 0) + 1
             return _mask(m.group(0)) if mode == "mask" else f"[REDACTED:{n}]"
-        out = pat.sub(repl, out)
+
+        out = sub(pat, repl, out)
 
     def ent_repl(m):
         s = m.group(0)
@@ -183,52 +467,92 @@ def redact(text: str, extra: "str | None" = None, mode: str = "full"):
             counts["entropy"] = counts.get("entropy", 0) + 1
             return _mask(s) if mode == "mask" else "[REDACTED:entropy]"
         return s
-    out = ENTROPY_LONG.sub(ent_repl, out)
 
+    return sub(ENTROPY_LONG, ent_repl, out)
+
+
+def _scan_detected(held, sub, counts):
+    """held[0] with each value detect-secrets finds in it replaced: raises ImportError when it is not installed.
+    held[0] keeps what was replaced before a failure, as one pass over a local did. The scratch file it scans goes
+    whatever happens, a write that fails too (a full disk, a character UTF-8 cannot hold): it holds the text before
+    detect-secrets hid anything."""
+    from detect_secrets import SecretsCollection
+    from detect_secrets.settings import default_settings
+
+    tf = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+    tmp = tf.name
     try:
-        from detect_secrets import SecretsCollection
-        from detect_secrets.settings import default_settings
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
-                                         encoding="utf-8") as tf:
-            tf.write(out)
-            tmp = tf.name
+        with tf:
+            tf.write(held[0])
+        col = SecretsCollection()
+        with default_settings():
+            col.scan_file(tmp)
+        for fname in col.files:
+            for s in col[fname]:
+                sv = s.secret_value
+                if sv and sv in held[0]:
+                    held[0] = sub(
+                        re.compile(re.escape(sv)), lambda m: "[REDACTED:ds]", held[0]
+                    )
+                    counts["ds:detect-secrets"] = counts.get("ds:detect-secrets", 0) + 1
+    finally:
         try:
-            col = SecretsCollection()
-            with default_settings():
-                col.scan_file(tmp)
-            for fname in col.files:
-                for s in col[fname]:
-                    sv = s.secret_value
-                    if sv and sv in out:
-                        out = out.replace(sv, "[REDACTED:ds]")
-                        counts["ds:detect-secrets"] = counts.get(
-                            "ds:detect-secrets", 0) + 1
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _hide_detected(out, sub, counts):
+    """`out` after detect-secrets, when it is installed; a WARN once a run when it is not, or when it fails."""
+    held = [out]
+    try:
+        _scan_detected(held, sub, counts)
     except ImportError:
         if not getattr(redact, "_ds_warned", False):
-            print("[lineage] WARN: detect-secrets unavailable, using fallback "
-                  "(pip install 'detect-secrets>=1.5')", file=sys.stderr)
+            print(
+                "[lineage] WARN: detect-secrets unavailable, using fallback "
+                "(pip install 'detect-secrets>=1.5')",
+                file=sys.stderr,
+            )
             redact._ds_warned = True
     except Exception as e:
         if not getattr(redact, "_ds_err_warned", False):
-            print(f"[lineage] WARN: detect-secrets error ({e}), continuing "
-                  "with fallback", file=sys.stderr)
+            print(
+                f"[lineage] WARN: detect-secrets error ({e}), continuing with fallback",
+                file=sys.stderr,
+            )
             redact._ds_err_warned = True
+    return held[0]
 
+
+def _hide_extra(out, extra, sub, counts):
+    """`out` with each --redact-extra keyword replaced; a marker an earlier pass left stays whole: a keyword inside
+    its name is no secret."""
+    for kw in [k.strip() for k in extra.split(",") if k.strip()]:
+        pat = re.compile(r"\[REDACTED(?::[^\]\s]*)?\]|" + re.escape(kw), re.IGNORECASE)
+        hits = []
+        out = sub(
+            pat,
+            lambda m: (
+                m.group(0)
+                if m.group(0).upper().startswith("[REDACTED")
+                else hits.append(1) or "[REDACTED]"
+            ),
+            out,
+        )
+        if hits:
+            counts[f"custom:{kw}"] = len(hits)
+    return out
+
+
+def redact(text: str, extra: "str | None" = None, mode: str = "full", trail=None):
+    """Multi-layer redaction; page_redact and review_redact join split secrets first (3.0.8). Returns (text, counts).
+    With `trail` (a _Trail), where each character of the result came from is followed too."""
+    counts, sub = {}, _sub_for(trail)
+    out = _hide_patterns(text, mode, sub, counts)
+    out = _hide_detected(out, sub, counts)
     if extra:
-        for kw in [k.strip() for k in extra.split(",") if k.strip()]:
-            # a marker an earlier pass left stays whole: a keyword inside its name is no secret
-            pat = re.compile(r"\[REDACTED(?::[^\]\s]*)?\]|" + re.escape(kw), re.IGNORECASE)
-            hits = []
-            out = pat.sub(lambda m: m.group(0) if m.group(0).upper().startswith("[REDACTED")
-                          else hits.append(1) or "[REDACTED]", out)
-            if hits:
-                counts[f"custom:{kw}"] = len(hits)
+        out = _hide_extra(out, extra, sub, counts)
     return out, counts
 
 
@@ -237,8 +561,10 @@ def redact(text: str, extra: "str | None" = None, mode: str = "full"):
 # follow (the end of an item in an argument list written without spaces). A match starts only
 # there, so no user runs past the place where the next match may start: a long run stays linear,
 # and a user joined to a variable by a - ("$USER"-bot) is read whole.
-_CU_USER = (r"(?:[^\s:=\"'`(]|[\"'`(](?!-(?:u|[A-Za-z0-9]{1,6}u[\s\"']|-user[\s=\"'])"
-            r"|,\\{0,7}[\"']))")
+_CU_USER = (
+    r"(?:[^\s:=\"'`(]|[\"'`(](?!-(?:u|[A-Za-z0-9]{1,6}u[\s\"']|-user[\s=\"'])"
+    r"|,\\{0,7}[\"']))"
+)
 # The quotes that may open the value, bare or escaped (\" and \\\" in a quoted command, '\'' and
 # '"'"' from bash and shlex.quote, ^" in cmd, `" in PowerShell, $' in bash): up to six in a row,
 # none that closes an item of an argument list.
@@ -249,12 +575,19 @@ _CU_LEAD = r"(?:[\\^`$]{0,7}[\"'](?!,\\{0,7}[\"'])){0,6}"
 # (mktemp -u "${TMPDIR:-/tmp}/x"). A literal password, or a default that is no path or holds a
 # colon, is hidden.
 _CU_REF = r"(?:\$\{?\w+\}?|%\w+%|\$\([^\s()]*(?:\s+[^\s()]+)*\))"
-_CU_SKIP = (r"(?!" + _CU_LEAD + r"(?:\+[\"']?%[-_0^#]?[A-Za-z%]|(?:\d+:\d+|(?:" + _CU_REF
-            + r"|[^\s:=\"'`(]*\)):" + _CU_REF + r")(?![^\s\"'`;|&)\\^])"
-            r"|\$\{\w+:[-=?+]?[/~.][^\s}\"'`(:]*\}[^\s:]*(?!\S)))")
+_CU_SKIP = (
+    r"(?!"
+    + _CU_LEAD
+    + r"(?:\+[\"']?%[-_0^#]?[A-Za-z%]|(?:\d+:\d+|(?:"
+    + _CU_REF
+    + r"|[^\s:=\"'`(]*\)):"
+    + _CU_REF
+    + r")(?![^\s\"'`;|&)\\^])"
+    r"|\$\{\w+:[-=?+]?[/~.][^\s}\"'`(:]*\}[^\s:]*(?!\S)))"
+)
 
-# Extra patterns for text a reviewer model reads (part files) and nothing else: the page
-# and --rulebase keep the patterns above, so their output stays as it was.
+# Patterns every page (the reviewed flow and --rulebase) and every part file hides with before the
+# page patterns above, while keys are whole (3.0.2).
 # A value a redaction already replaced: a marker ([REDACTED...]) or a value that is only a mask
 # (abcd****wxyz: up to 4 characters, a whole run of *, up to 4 characters, then the value ends; a
 # closing `, |, * or ) and then . , ; : ! ? may stand between, as in **password: ****h12** or
@@ -270,28 +603,52 @@ _MARKER_UNIT = r"\[REDACTED:\w+\]"
 
 REVIEW_SECRET_PATTERNS = [
     ("AnthropicKey", re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}")),
-    ("OpenAIKey", re.compile(r"(?<![A-Za-z0-9-])sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}")),
+    (
+        "OpenAIKey",
+        re.compile(r"(?<![A-Za-z0-9-])sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}"),
+    ),
     ("GoogleKey", re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}")),
     # bounded repeats: a long run of `key` or `a.` would otherwise take quadratic time
-    ("HexKey", re.compile(r"(?i)(?:key|token|secret)[\w-]{0,100}\s*[:=]\s*['\"]?[0-9a-f]{32,}")),
+    (
+        "HexKey",
+        re.compile(
+            r"(?i)(?:key|token|secret)[\w-]{0,100}\s*[:=]\s*['\"]?[0-9a-f]{32,}"
+        ),
+    ),
     # a value, not a path, a variable or a redaction ($PWD is a variable, PGPASSWORD a name);
     # markdown, a table cell or a bracket that closes after the value stays outside the match
-    ("PasswordBare", re.compile(
-        r"(?i)(?<!\$)(?:password|passwd|passcode|pwd|암호|비번|비밀\s?번호|패스워드)\s*[:=]\s*"
-        r"(?![/~$])" + _NOT_REDACTED + r"(?=[^\s'\"]{6})[^\s'\"]*[^\s'\"`|*)]")),
+    (
+        "PasswordBare",
+        re.compile(
+            r"(?i)(?<!\$)(?:password|passwd|passcode|pwd|암호|비번|비밀\s?번호|패스워드)\s*[:=]\s*"
+            r"(?![/~$])" + _NOT_REDACTED + r"(?=[^\s'\"]{6})[^\s'\"]*[^\s'\"`|*)]"
+        ),
+    ),
     # the password runs to the last @ before the host: it may hold an @ of its own. A marker is
     # no user or password, so a second pass leaves a token-only URL (https://[REDACTED:...]@host).
-    ("UrlCredential", re.compile(r"(?i)[a-z][a-z0-9+.-]{0,30}://(?:" + _MARKER_UNIT + r"|[^\s:@/])*:" + _NOT_MARKED
-                                 + r"(?!\[REDACTED)[^\s/]{3,}@")),
+    (
+        "UrlCredential",
+        re.compile(
+            r"(?i)[a-z][a-z0-9+.-]{0,30}://(?:"
+            + _MARKER_UNIT
+            + r"|[^\s:@/])*:"
+            + _NOT_MARKED
+            + r"(?!\[REDACTED)[^\s/]{3,}@"
+        ),
+    ),
     ("Bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}")),
     # Authorization then `:`, `=`, `=>` or headers["Authorization"] =, a call's ("Authorization",
     # "...") and a HAR name/value pair, or a space before a quote (nginx, Apache)
-    ("BasicAuth", re.compile(
-        r"(?i)\bauthorization"
-        r"(?:[\"']?\]?\s*(?:=>|[:=])"
-        r"|[\"']\s*,\s*(?:[\"']value[\"']\s*:\s*)?(?=[\"'])"
-        r"|\s+(?=[\"']))"
-        r"\s*[\"']?basic\s+[A-Za-z0-9+/]{8,}={0,2}")),
+    (
+        "BasicAuth",
+        re.compile(
+            r"(?i)\bauthorization"
+            r"(?:[\"']?\]?\s*(?:=>|[:=])"
+            r"|[\"']\s*,\s*(?:[\"']value[\"']\s*:\s*)?(?=[\"'])"
+            r"|\s+(?=[\"']))"
+            r"\s*[\"']?basic\s+[A-Za-z0-9+/]{8,}={0,2}"
+        ),
+    ),
     # curl's -u and --user flags, alone or last in a bundle (-su, -4u), with a user and password
     # after a space, an = or nothing, quoted together or apart ("user":"pw"), with quotes bare,
     # escaped or nested (_CU_LEAD) or none, in inline code or parentheses, or as two items of an
@@ -300,47 +657,226 @@ REVIEW_SECRET_PATTERNS = [
     # long key as the user with no password, count too. The separators share no character with
     # the user name, so a long run of them stays linear. The values _CU_SKIP names and a
     # host:/path (rsync) are left, and so is a marker an earlier pass left (-u [REDACTED:JWT]).
-    ("CurlUser", re.compile(
-        r"(?<![^\s\"'`(])(?:-u\s*|-[A-Za-z0-9]{1,6}u\s+|--user(?:\s+|=))" + _CU_SKIP + _CU_LEAD
-        + r"(?:(?:" + _MARKER_UNIT + r"|" + _CU_USER + r")*:" + _NOT_MARKED + r"(?!/|\[REDACTED)\S{3,}|" + _CU_USER
-        + r"{15,}:" + _NOT_MARKED
-        + r"(?=[\s\"'`).,;\\]|$))"
-        r"|(\\{0,7}[\"'])(?:-[A-Za-z0-9]{0,6}u|--user)\1\s*,\s*(\\{0,7}[\"'])" + _CU_SKIP
-        + r"(?:(?:" + _MARKER_UNIT + r"|" + _CU_USER + r")*:" + _NOT_MARKED + r"(?!/|\[REDACTED)[^\s\"']{3,}|"
-        + _CU_USER + r"{15,}:"
-        + _NOT_MARKED + r")\2")),
+    (
+        "CurlUser",
+        re.compile(
+            r"(?<![^\s\"'`(])(?:-u\s*|-[A-Za-z0-9]{1,6}u\s+|--user(?:\s+|=))"
+            + _CU_SKIP
+            + _CU_LEAD
+            + r"(?:(?:"
+            + _MARKER_UNIT
+            + r"|"
+            + _CU_USER
+            + r")*:"
+            + _NOT_MARKED
+            + r"(?!/|\[REDACTED)\S{3,}|"
+            + _CU_USER
+            + r"{15,}:"
+            + _NOT_MARKED
+            + r"(?=[\s\"'`).,;\\]|$))"
+            r"|(\\{0,7}[\"'])(?:-[A-Za-z0-9]{0,6}u|--user)\1\s*,\s*(\\{0,7}[\"'])"
+            + _CU_SKIP
+            + r"(?:(?:"
+            + _MARKER_UNIT
+            + r"|"
+            + _CU_USER
+            + r")*:"
+            + _NOT_MARKED
+            + r"(?!/|\[REDACTED)[^\s\"']{3,}|"
+            + _CU_USER
+            + r"{15,}:"
+            + _NOT_MARKED
+            + r")\2"
+        ),
+    ),
 ]
 
 
-def _reviewer_patterns(text):
+def _reviewer_patterns(text, trail=None):
     """`text` with what the reviewer patterns find replaced whole by [REDACTED:<name>], and the
-    count by name."""
-    counts = {}
+    count by name. A split secret is put back together by its callers first (3.0.8)."""
+    counts, sub = {}, _sub_for(trail)
     for name, pat in REVIEW_SECRET_PATTERNS:
-        text, k = pat.subn(f"[REDACTED:{name}]", text)
-        if k:
-            counts[name] = k
+        hits = []
+        text = sub(
+            pat, lambda m, marker=f"[REDACTED:{name}]": hits.append(1) or marker, text
+        )
+        if hits:
+            counts[name] = len(hits)
     return text, counts
+
+
+def _rejoin_secrets(text, extra=None, trail=None):
+    """`text` with each secret a splitter cuts put back together, for every pattern a page or a reviewer's text is
+    hidden with: the reviewer's, the page's, the entropy rule and the --redact-extra keywords (3.0.8)."""
+    keywords = [k.strip() for k in (extra or "").split(",") if k.strip()]
+    patterns = (
+        [p for _, p in REVIEW_SECRET_PATTERNS]
+        + [p for _, p in SECRET_PATTERNS]
+        + [re.compile(re.escape(k), re.IGNORECASE) for k in keywords]
+    )
+    return _rejoin_split(text, patterns, entropy=True, trail=trail)
+
+
+def _join_first(text, extra, one_pass):
+    """`one_pass` (text, trail -> (text, found)) over `text` with its split secrets put back together. Once anything
+    was joined, again over its output until a pass changes nothing (at most four passes): a value next to one a
+    marker replaced may be found only then. Returns (text, [found], the _Trail of the text, or None when nothing
+    was joined)."""
+    trail = _Trail(len(text)) if _SPLITTER_RE.search(text) else None
+    joined = _rejoin_secrets(text, extra, trail)
+    moved = joined != text
+    red, found = one_pass(joined, trail)
+    founds = [found]
+    for _ in range(3):
+        joined = _rejoin_secrets(red, extra, trail)
+        if joined == red and not moved:
+            break  # nothing joined: 3.0.7's one pass is final
+        moved = True
+        again, found = one_pass(joined, trail)
+        if again == red:
+            break
+        red = again
+        founds.append(found)
+    return red, founds, trail if moved else None
+
+
+# The key patterns that may find the same key: one kind when passes are compared.
+_KEY_FAMILY = {"AnthropicKey": "key", "OpenAIKey": "key", "GoogleKey": "key"}
+
+
+def _kinds(founds):
+    """How many values of each kind the passes hid, the entropy rule and detect-secrets apart: joining pieces
+    changes how many runs the entropy rule sees."""
+    kinds = {}
+    for found in founds:
+        for k, v in found.items():
+            if k != "entropy" and not k.startswith("ds:"):
+                k = _KEY_FAMILY.get(k, k)
+                kinds[k] = kinds.get(k, 0) + v
+    return kinds
+
+
+def _from_floor(red, found, extra, one_pass):
+    """Joining as _join_first does, but from the output of one pass over the text as it stands."""
+    founds = [found]
+    for _ in range(4):
+        joined = _rejoin_secrets(red, extra)
+        if joined == red:
+            break
+        again, found = one_pass(joined)
+        if again == red:
+            break
+        red = again
+        founds.append(found)
+    return red, founds
+
+
+def _hidden_by(floor, base):
+    """The stretches of the text it started as that `floor` (whose trail is `base`) hides, in order, each with what
+    stands for it in `floor`: [(start, end, marker)]."""
+    pos, out, i, n = base.pos, [], 0, len(floor)
+    while i < n:
+        if pos[i] >= 0:
+            i += 1
+            continue
+        j = i
+        while j < n and pos[j] < 0:
+            j += 1
+        out.append(
+            (pos[i - 1] + 1 if i else 0, pos[j] if j < n else base.n, floor[i:j])
+        )
+        i = j
+    return out
+
+
+def _patched(red, trail, shown, hidden):
+    """`red` (whose trail is `trail`) with each run of characters it shows that `shown` has hidden put under what
+    stands for them in that text (`hidden`, from _hidden_by), and how many markers that took by name."""
+    pos, starts = trail.pos, [lo for lo, _, _ in hidden]
+    out, counts, at, i = [], {}, 0, 0
+    while i < len(red):
+        if pos[i] < 0 or shown[pos[i]]:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(red) and pos[j] >= 0 and not shown[pos[j]]:
+            j += 1
+        marker = hidden[bisect.bisect_right(starts, pos[i]) - 1][2]
+        name = re.fullmatch(r"\[REDACTED:(\w+)\]", marker)
+        if name:
+            counts[name.group(1)] = counts.get(name.group(1), 0) + 1
+        out += [red[at:i], marker]
+        at = i = j
+    return "".join(out) + red[at:], counts
+
+
+def _with_rejoins(text, extra, one_pass):
+    """_join_first, with each character it shows that one pass over the text as it stands hid (3.0.7 did that one
+    pass) put back under that pass's marker; but if it hides fewer values of some kind, the joining starts from that
+    pass's output instead. Each pass only hides more, so no character 3.0.7 hid shows (3.0.8). Returns (text,
+    [found])."""
+    red, founds, trail = _join_first(text, extra, one_pass)
+    if trail is None:
+        return (
+            red,
+            founds,
+        )  # nothing joined: that was the one pass over the text as it stands
+    base = _Trail(len(text))
+    floor, found = one_pass(text, base)
+    joined = _kinds(founds)
+    if not all(joined.get(k, 0) >= v for k, v in _kinds([found]).items()):
+        return _from_floor(floor, found, extra, one_pass)
+    shown = base.shown()
+    if not _shows_more(trail, shown):
+        return red, founds
+    patched, put_back = _patched(red, trail, shown, _hidden_by(floor, base))
+    again, found = one_pass(patched)
+    out, more = _from_floor(again, found, extra, one_pass)
+    return out, founds + [put_back] + more
+
+
+def _review_pass(text, extra, trail=None):
+    pre, counts = _reviewer_patterns(text, trail)
+    red, found = redact(pre, extra=extra, mode="full", trail=trail)
+    for k, v in found.items():
+        counts[k] = counts.get(k, 0) + v
+    return red, counts
 
 
 def review_redact(text, extra=None):
     """Text as a reviewer model reads it: the reviewer-only patterns first, while the keys
     are whole (the entropy rule would otherwise cut a key and leave the rest), then fully
-    redacted (never masked, whatever --redact-mode says). Returns (text, count)."""
-    pre, counts = _reviewer_patterns(text)
-    red, found = redact(pre, extra=extra, mode="full")
-    return red, sum(counts.values()) + sum(found.values())
+    redacted (never masked, whatever --redact-mode says). A secret a splitter cuts is put back
+    together (3.0.8). Returns (text, count)."""
+    red, founds = _with_rejoins(
+        text, extra, lambda t, trail=None: _review_pass(t, extra, trail)
+    )
+    return red, sum(sum(f.values()) for f in founds)
+
+
+def _page_pass(text, extra, mode, trail=None):
+    pre, counts = _reviewer_patterns(text, trail)
+    red, found = redact(pre, extra=extra, mode=mode, trail=trail)
+    for k, v in found.items():
+        counts[k] = counts.get(k, 0) + v
+    return red, counts
 
 
 def page_redact(text, extra=None, mode="full"):
     """Text as every page shows it (3.0.2): the reviewer patterns first, while keys are whole,
     each hit replaced whole whatever --redact-mode says (a mask keeps 4+4 characters, most of
-    a short password); then the page's redaction with this run's mode and keywords. Returns
-    (text, count_by_kind); a second pass over its output finds nothing."""
-    pre, counts = _reviewer_patterns(text)
-    red, found = redact(pre, extra=extra, mode=mode)
-    for k, v in found.items():
-        counts[k] = counts.get(k, 0) + v
+    a short password); then the page's redaction with this run's mode and keywords. A secret a
+    splitter cuts is put back together (3.0.8). Returns (text, count_by_kind). A second pass
+    over its output finds nothing, but for two values glued with no separator at all (a key
+    run into `Bearer`), where the second shows only once the first is a marker, as in 3.0.7."""
+    red, founds = _with_rejoins(
+        text, extra, lambda t, trail=None: _page_pass(t, extra, mode, trail)
+    )
+    counts = {}
+    for found in founds:
+        for k, v in found.items():
+            counts[k] = counts.get(k, 0) + v
     return red, counts
 
 
@@ -378,23 +914,111 @@ def encode_cwd(cwd) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
 
 
+def codex_sessions_dir():
+    """Where Codex keeps its session records (rollouts): <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl."""
+    home = os.environ.get("CODEX_HOME") or str(pathlib.Path.home() / ".codex")
+    return pathlib.Path(home) / "sessions"
+
+
+def _codex_thread():
+    """This Codex session's id when lineage runs inside Codex (Codex gives its shell CODEX_THREAD_ID, the id at the
+    end of the rollout file name), else None."""
+    tid = os.environ.get("CODEX_THREAD_ID", "")
+    return tid if re.fullmatch(r"[0-9A-Za-z-]{8,64}", tid) else None
+
+
+def _mtime(path):
+    """A file's change time, or 0 for one that went away between the listing and the look."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def _codex_rollouts(pattern):
+    try:
+        found = list(codex_sessions_dir().glob(f"*/*/*/{pattern}"))
+    except OSError:
+        return []
+    return sorted(found, key=_mtime)
+
+
+def _codex_meta(path):
+    """The session_meta payload a rollout opens with, else None (not a Codex rollout, or unreadable). Only a regular
+    file is opened, so a named pipe is not waited on."""
+    try:
+        if not stat.S_ISREG(os.stat(str(path)).st_mode):
+            return None
+        with open(path, encoding="utf-8") as f:
+            obj = json.loads(f.readline())
+        return (
+            obj["payload"]
+            if obj.get("type") == "session_meta"
+            and isinstance(obj.get("payload"), dict)
+            else None
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        RecursionError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ):
+        return None
+
+
+def _codex_cwd(path):
+    """The cwd a rollout's first record (session_meta) names, else None. A subagent's rollout (its source names
+    the parent thread) gives None: what the parent handed it reads as a user turn, so it is no session of the user."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.loads(f.readline())
+        meta = obj["payload"] if obj.get("type") == "session_meta" else {}
+        source = meta.get("source")
+        if isinstance(source, dict) and "subagent" in source:
+            return None
+        return meta.get("cwd")
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        RecursionError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ):
+        return None
+
+
 def auto_discover_jsonl():
-    projdir = pathlib.Path.home() / ".claude" / "projects" / encode_cwd(
-        pathlib.Path.cwd())
+    tid = _codex_thread()
+    if tid:  # inside Codex: this session or nothing, never a Claude Code one
+        found = _codex_rollouts(f"rollout-*-{tid}.jsonl")
+        return found[-1] if found else None
+    projdir = (
+        pathlib.Path.home() / ".claude" / "projects" / encode_cwd(pathlib.Path.cwd())
+    )
     if not projdir.exists():
         return None
     try:
-        files = sorted(projdir.glob("*.jsonl"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        files = sorted(
+            projdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
     except OSError:
         return None
     return files[0] if files else None
 
 
 def project_jsonl_files():
-    """All *.jsonl in the encoded project dir, for --all-sessions."""
-    projdir = pathlib.Path.home() / ".claude" / "projects" / encode_cwd(
-        pathlib.Path.cwd())
+    """All *.jsonl in the encoded project dir, for --all-sessions. Inside Codex, the Codex sessions of this folder."""
+    if _codex_thread():
+        here = str(pathlib.Path.cwd())
+        return [p for p in _codex_rollouts("rollout-*.jsonl") if _codex_cwd(p) == here]
+    projdir = (
+        pathlib.Path.home() / ".claude" / "projects" / encode_cwd(pathlib.Path.cwd())
+    )
     if not projdir.exists():
         return []
     try:
@@ -421,11 +1045,284 @@ def session_start(path):
 # ---------------------------------------------------------------- JSONL parse
 KNOWN_TYPES = {"user", "assistant", "agent-setting", "permission-mode", "summary"}
 KNOWN_CONTENT_ITEMS = {"text", "tool_use", "tool_result", "thinking"}
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")   # strip control chars (keeps \t\n)
+_CTRL_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f]"
+)  # strip control chars (keeps \t\n)
+# What a JSON escape for a lone surrogate (U+D800 to U+DFFF with no pair) leaves in a str. UTF-8 cannot hold one,
+# so a page, a review pack or a cache key that has it stops with UnicodeEncodeError.
+_LONE_SURROGATE_RE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 
 
-def parse_turns(stream, unsafe_schema: bool = False, session_id=None,
-                session_name=None):
+def _without_lone_surrogates(value: Any) -> Any:
+    """value with each lone surrogate in its strings as U+FFFD, through lists and dicts (keys too). Any, as the
+    JSON it takes is: the callers check the shape after."""
+    if isinstance(value, str):
+        return _LONE_SURROGATE_RE.sub(chr(0xFFFD), value)
+    if isinstance(value, list):
+        return [_without_lone_surrogates(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            _without_lone_surrogates(k): _without_lone_surrogates(v)
+            for k, v in value.items()
+        }
+    return value
+
+
+def _lone_to_fffd(value):
+    """A str with each lone surrogate as U+FFFD; anything else as it is (no walk into it)."""
+    return (
+        _LONE_SURROGATE_RE.sub(chr(0xFFFD), value) if isinstance(value, str) else value
+    )
+
+
+def _shown_id(value):
+    """An id from a transcript or a reviewer as a message shows it: as it is when it prints as one plain line, else its
+    repr, so a line break or a control character in it cannot forge a line of lineage's own."""
+    return value if isinstance(value, str) and value.isprintable() else repr(value)
+
+
+def _clean_strings(line_no, role, text, tools, ts, uuid_):
+    """A record's role, text, tool counts, timestamp and uuid with each lone surrogate as U+FFFD, after one WARN for
+    the line. Only text is touched: a uuid of another shape is replaced later, whole."""
+    if not any(
+        isinstance(s, str) and _LONE_SURROGATE_RE.search(s)
+        for s in (role, text, ts, uuid_, *tools)
+    ):
+        return role, text, tools, ts, uuid_
+    print(
+        f"[WARN] line {line_no}: lone surrogate replaced with U+FFFD", file=sys.stderr
+    )
+    counts = {}
+    for name, n in tools.items():
+        name = _lone_to_fffd(name)
+        counts[name] = counts.get(name, 0) + n
+    clean = _lone_to_fffd
+    return clean(role), clean(text), counts, clean(ts), clean(uuid_)
+
+
+def _turn_id(uuid_, line_no, ts):
+    """The record's uuid when it is text, else an id from the line and the timestamp: a missing or empty one as
+    before, another shape (a list, an object, a number) after a WARN, since ids are dict keys and joined text."""
+    if isinstance(uuid_, str) and uuid_:
+        return uuid_
+    if uuid_ is not None and uuid_ != "":
+        print(
+            f"[WARN] line {line_no}: uuid that is not text replaced by an id from the line",
+            file=sys.stderr,
+        )
+    return hashlib.sha256(f"{line_no}:{ts}".encode()).hexdigest()[:16]
+
+
+def _json_object(raw, line_no):
+    """The JSON object a transcript line holds, else None after a WARN: a line that is not JSON, is nested
+    deeper than the parser reads, holds a number longer than it reads (ValueError since 3.11), or holds
+    something other than an object is skipped, not fatal."""
+    try:
+        obj = json.loads(raw)
+    except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
+        print(f"[WARN] line {line_no}: invalid JSON skipped", file=sys.stderr)
+        return None
+    if not isinstance(obj, dict):
+        print(f"[WARN] line {line_no}: not a JSON object skipped", file=sys.stderr)
+        return None
+    return obj
+
+
+def _is_turn_record(obj, seen_unknown_type, unsafe_schema, line_no):
+    """Whether a record is a user or assistant turn. A side chain or a team record is not, nor is another type:
+    one nobody knows is named once, and a schema marker (v...) stops the run unless --unsafe-schema. A record
+    whose type, or a turn whose message, has a shape a transcript does not give is named and skipped."""
+    if obj.get("isSidechain") or obj.get("teamName") or obj.get("agentName"):
+        return False
+    t = obj.get("type")
+    if (t and not isinstance(t, str)) or (
+        t in ("user", "assistant") and _odd_message(obj.get("message"))
+    ):
+        print(
+            f"[WARN] line {line_no}: record of an unknown shape skipped",
+            file=sys.stderr,
+        )
+        return False
+    if t in ("user", "assistant"):
+        return True
+    if t and t not in KNOWN_TYPES and t not in seen_unknown_type:
+        seen_unknown_type.add(t)
+        print(
+            f"[WARN] unknown record type {t!r} skipped", file=sys.stderr
+        )  # repr: no raw control character
+        if not unsafe_schema and t.startswith("v"):
+            print(
+                f"[ERROR] schema marker {t!r} unrecognized — "
+                "rerun with --unsafe-schema to proceed",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    return False
+
+
+def _stamp(ts):
+    """A record's timestamp when it is text, else None: a number or another shape reads as a missing one."""
+    return ts if isinstance(ts, str) else None
+
+
+def _odd_message(msg):
+    """Whether a turn's message has a shape a transcript does not give (a missing or empty one reads as empty)."""
+    return bool(msg) and not isinstance(msg, dict)
+
+
+def _odd_item(it, text, name):
+    """Whether a content item's type, text or tool name has a shape a transcript does not give. A missing or empty
+    text reads as empty and a missing or null tool name as '?'."""
+    return (
+        (it is not None and not isinstance(it, str))
+        or (it == "text" and not isinstance(text, str))
+        or (it == "tool_use" and not isinstance(name, str))
+    )
+
+
+def _take_item(item, line_no, text_parts, tools):
+    """Add one item of a message's content list to the text parts or the tool counts. An item whose type, text or
+    tool name has a shape a transcript does not give is named and skipped."""
+    if not isinstance(item, dict):
+        return
+    it, text, name = item.get("type"), item.get("text") or "", item.get("name")
+    name = "?" if name is None else name
+    if _odd_item(it, text, name):
+        print(
+            f"[WARN] line {line_no}: content item of an unknown shape skipped",
+            file=sys.stderr,
+        )
+    elif it == "text":
+        text_parts.append(text)
+    elif it == "tool_use":
+        tools[name] = tools.get(name, 0) + 1
+    elif it not in KNOWN_CONTENT_ITEMS:
+        print(
+            f"[WARN] line {line_no}: unknown content type {it!r} skipped",
+            file=sys.stderr,
+        )
+
+
+def _content_parts(content, line_no):
+    """(text parts, tool counts) of a message's content, or None for a shape nobody knows (named in a WARN
+    unless the content is missing)."""
+    text_parts, tools = [], {}
+    if isinstance(content, str):
+        text_parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            _take_item(item, line_no, text_parts, tools)
+    else:
+        if content is not None:
+            print(
+                f"[WARN] line {line_no}: unknown content shape "
+                f"({type(content).__name__})",
+                file=sys.stderr,
+            )
+        return None
+    return text_parts, tools
+
+
+def _is_codex_meta(obj):
+    """Whether a record opens a Codex session record (rollout): a session_meta with a payload."""
+    return obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict)
+
+
+_CODEX_ITEM_ROLE = {"UserMessage": "user", "AgentMessage": "assistant"}
+_CODEX_INNER_TOOL_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_]{0,63})\(")
+
+
+def _codex_item_text(item):
+    """The text parts of a completed item (Codex 0.160: content [{type: text|Text, text}])."""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        c["text"]
+        for c in content
+        if isinstance(c, dict) and isinstance(c.get("text"), str)
+    )
+
+
+def _codex_tools(p, pt):
+    """Tool counts of one call record. Codex 0.160 runs tools from code (`exec` with `tools.exec_command(...)` in its
+    input), so the inner tool names count, not the wrapper."""
+    name = p.get("name")
+    name = name if isinstance(name, str) and name else pt[:-5]
+    inner = (
+        _CODEX_INNER_TOOL_RE.findall(p.get("input"))
+        if isinstance(p.get("input"), str)
+        else []
+    )
+    counts = {}
+    for n in inner or [name]:
+        counts[n] = counts.get(n, 0) + 1
+    return counts
+
+
+def _codex_record(obj):
+    """(role, text, tools) a Codex rollout record shows as a turn, else None. What the user typed and what the
+    model said come from the event records (0.144: user_message, agent_message; 0.160: item_completed with a
+    UserMessage or AgentMessage item), so what Codex puts into the model input (environment, instructions, an
+    injected skill body) is not a turn; a tool call is an assistant record with no text, merged into the turn around
+    it like a Claude Code tool_use; a compaction is a divider."""
+    p = obj.get("payload")
+    kind = obj.get("type")
+    if kind == "compacted":
+        return "mark", "compaction", {}
+    if not isinstance(p, dict):
+        return None
+    pt = p.get("type")
+    if kind == "event_msg" and pt in ("user_message", "agent_message"):
+        msg = p.get("message")
+        return (
+            ("user" if pt == "user_message" else "assistant"),
+            (msg if isinstance(msg, str) else ""),
+            {},
+        )
+    item = p.get("item")
+    if (
+        kind == "event_msg"
+        and pt == "item_completed"
+        and isinstance(item, dict)
+        and item.get("type") in _CODEX_ITEM_ROLE
+    ):
+        return _CODEX_ITEM_ROLE[item["type"]], _codex_item_text(item), {}
+    if kind == "response_item" and isinstance(pt, str) and pt.endswith("_call"):
+        return "assistant", "", _codex_tools(p, pt)
+    return None
+
+
+def _codex_turn(obj, line_no, session_id, session_name):
+    """The turn dict of one Codex rollout record, else None."""
+    got = _codex_record(obj)
+    if got is None:
+        return None
+    role, text, tools = got
+    text = _CTRL_RE.sub("", text.strip())
+    if not text and not tools:
+        return None
+    role, text, tools, ts, uuid_ = _clean_strings(
+        line_no, role, text, tools, _stamp(obj.get("timestamp")), None
+    )
+    uuid_ = _turn_id(uuid_, line_no, ts)
+    return {
+        "role": role,
+        "text": text,
+        "ts": ts,
+        "uuid": uuid_,
+        "tools": tools,
+        "line_no": line_no,
+        "parts": [text] if text else [],
+        "session": session_id,
+        "session_name": session_name,
+        "meta": False,
+    }
+
+
+def parse_turns(
+    stream, unsafe_schema: bool = False, session_id=None, session_name=None
+):
     """Yield dicts: {role, text, ts, uuid, tools, line_no, parts, session,
     session_name}.
 
@@ -434,72 +1331,58 @@ def parse_turns(stream, unsafe_schema: bool = False, session_id=None,
     needs it) and `session` (session guards for merge/echo).
     """
     seen_unknown_type = set()
+    codex = None  # set by the first record: a Codex rollout or a Claude transcript
+    last_said = (
+        None  # Codex: (role, text) of the last message, so one said twice counts once
+    )
     for line_no, raw in enumerate(stream, 1):
         raw = raw.strip()
         if not raw:
             continue
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            print(f"[WARN] line {line_no}: invalid JSON skipped", file=sys.stderr)
+        obj = _json_object(raw, line_no)
+        if obj is not None and codex is None:
+            codex = _is_codex_meta(obj)
+        if obj is not None and codex:
+            turn = _codex_turn(obj, line_no, session_id, session_name)
+            said = (turn["role"], turn["text"]) if turn and turn["text"] else None
+            if turn and not (said and said == last_said):
+                yield turn
+            if said:
+                last_said = said
             continue
-        if obj.get("isSidechain"):
+        if obj is None or not _is_turn_record(
+            obj, seen_unknown_type, unsafe_schema, line_no
+        ):
             continue
-        if obj.get("teamName") or obj.get("agentName"):
-            continue
-        t = obj.get("type")
-        if t not in ("user", "assistant"):
-            if t and t not in KNOWN_TYPES and t not in seen_unknown_type:
-                seen_unknown_type.add(t)
-                print(f"[WARN] unknown record type '{t}' skipped", file=sys.stderr)
-                if not unsafe_schema and t and t.startswith("v"):
-                    print(f"[ERROR] schema marker '{t}' unrecognized — "
-                          "rerun with --unsafe-schema to proceed",
-                          file=sys.stderr)
-                    raise SystemExit(2)
-            continue
-
         msg = obj.get("message") or {}
-        role = msg.get("role") or t
-        content = msg.get("content")
-        ts = obj.get("timestamp")
-        uuid_ = obj.get("uuid") or hashlib.sha256(
-            f"{line_no}:{ts}".encode()).hexdigest()[:16]
-
-        text_parts = []
-        tools = {}
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                it = item.get("type")
-                if it == "text":
-                    text_parts.append(item.get("text") or "")
-                elif it == "tool_use":
-                    tools[item.get("name", "?")] = tools.get(
-                        item.get("name", "?"), 0) + 1
-                elif it in ("tool_result", "thinking"):
-                    continue
-                elif it not in KNOWN_CONTENT_ITEMS:
-                    print(f"[WARN] line {line_no}: unknown content type "
-                          f"'{it}' skipped", file=sys.stderr)
-        else:
-            if content is not None:
-                print(f"[WARN] line {line_no}: unknown content shape "
-                      f"({type(content).__name__})", file=sys.stderr)
+        got = _content_parts(msg.get("content"), line_no)
+        if got is None:
             continue
-
+        text_parts, tools = got
         text = _CTRL_RE.sub("", "\n".join(p for p in text_parts if p).strip())
         if not text and not tools:
             continue
+        role = msg.get("role")
+        role = (
+            role if role in ("user", "assistant") else obj.get("type")
+        )  # the type _is_turn_record let through
+        role, text, tools, ts, uuid_ = _clean_strings(
+            line_no, role, text, tools, _stamp(obj.get("timestamp")), obj.get("uuid")
+        )
+        uuid_ = _turn_id(uuid_, line_no, ts)
 
-        yield {"role": role, "text": text, "ts": ts, "uuid": uuid_,
-               "tools": tools, "line_no": line_no,
-               "parts": [text] if text else [],       # R1: always seed parts
-               "session": session_id, "session_name": session_name,
-               "meta": bool(obj.get("isMeta"))}       # a harness-injected body
+        yield {
+            "role": role,
+            "text": text,
+            "ts": ts,
+            "uuid": uuid_,
+            "tools": tools,
+            "line_no": line_no,
+            "parts": [text] if text else [],  # R1: always seed parts
+            "session": session_id,
+            "session_name": session_name,
+            "meta": bool(obj.get("isMeta")),
+        }  # a harness-injected body
 
 
 # ---------------------------------------------------------------- Classify (A-1..A-4)
@@ -521,9 +1404,11 @@ def classify_turns(turns, drop_trivia=True):
         if _HOOK_FEEDBACK_RE.match(text) or _INTERRUPT_RE.match(text):
             continue
         # 2. injected skill/workflow body & harness errors → drop if trivia
-        if drop_trivia and (_SKILL_BODY_RE.match(text)
-                            or _WORKFLOW_BODY_RE.match(text)
-                            or _SYS_ERROR_RE.match(text)):
+        if drop_trivia and (
+            _SKILL_BODY_RE.match(text)
+            or _WORKFLOW_BODY_RE.match(text)
+            or _SYS_ERROR_RE.match(text)
+        ):
             continue
         # 3. image note → replace with attachment marker
         if _IMAGE_NOTE_RE.match(text):
@@ -536,7 +1421,7 @@ def classify_turns(turns, drop_trivia=True):
         # 5. agent / teammate wrapper → agent bubble
         who, body = split_agent_message(text)
         if who is not None:
-            if not body:                              # idle notification
+            if not body:  # idle notification
                 continue
             out.append(dict(t, role="agent", text=body, agent_from=who))
             continue
@@ -558,8 +1443,12 @@ def merge_assistant_runs(turns):
     merged = []
     for t in turns:
         p = merged[-1] if merged else None
-        if (p and t["role"] == "assistant" and p["role"] == "assistant"
-                and t.get("session") == p.get("session")):
+        if (
+            p
+            and t["role"] == "assistant"
+            and p["role"] == "assistant"
+            and t.get("session") == p.get("session")
+        ):
             if t["text"]:
                 p["text"] = (p["text"] + "\n\n" + t["text"]).strip()
                 p["parts"].append(t["text"])
@@ -580,9 +1469,13 @@ def echo_indices(turns):
         if t["role"] != "user" or len(t["text"]) > ECHO_ASK:
             continue
         n = turns[i + 1] if i + 1 < len(turns) else None
-        if (n and n["role"] == "assistant" and not n["tools"]
-                and len(n["text"].strip()) <= ECHO_REPLY
-                and n.get("session") == t.get("session")):
+        if (
+            n
+            and n["role"] == "assistant"
+            and not n["tools"]
+            and len(n["text"].strip()) <= ECHO_REPLY
+            and n.get("session") == t.get("session")
+        ):
             drop |= {i, i + 1}
     return drop
 
@@ -612,7 +1505,8 @@ def fill_missing_ts(turns):
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])(?<![0-9][.!?…])(?=\s|$)\s*|\n+")
 _INTENT_ONLY_RE = re.compile(
     r"^.{0,30}(?:하겠습니다|합니다|해보겠습니다|확인합니다|봅니다|"
-    r"보겠습니다|시작합니다|진행합니다)\.?$")
+    r"보겠습니다|시작합니다|진행합니다)\.?$"
+)
 SHORT_DETAIL = 160
 SINGLE_SPLIT_MIN = SHORT_DETAIL
 
@@ -624,7 +1518,7 @@ def _cut(s, n):
     s = s.strip()
     if len(s) <= n:
         return s
-    head = _OPEN_MARKER_RE.sub("", s[:max(1, n - 1)])   # a marker cut in two goes whole
+    head = _OPEN_MARKER_RE.sub("", s[: max(1, n - 1)])  # a marker cut in two goes whole
     return head.rstrip() + "…"
 
 
@@ -692,26 +1586,28 @@ def _stdin_id_key():
     to a model that never sees the key, so an id gives no way to test a guessed password. With no
     cache folder to keep it in, the key lasts one run."""
     path = CACHE_BASE / "stdin-id.key"
-    try:
-        key = path.read_bytes()
-        if len(key) == 32:
-            return key
-    except OSError:
-        pass
+    key = _read_small(path, 64)
+    if key is not None and len(key) == 32:
+        return key
     key = os.urandom(32)
-    tmp = path.with_name("%s.%d" % (path.name, os.getpid()))
+    tmp = None
     try:
         CACHE_BASE.mkdir(parents=True, exist_ok=True)
         os.chmod(str(CACHE_BASE), 0o700)
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+        # mkstemp: a fresh random name made exclusively (0600), so no link can be planted at it
+        # first (Windows opens O_EXCL through a link to nothing and makes the file it leads to)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(CACHE_BASE), prefix=f".{path.name}.", suffix=".tmp"
+        )
         with os.fdopen(fd, "wb") as f:
             f.write(key)
-        os.replace(str(tmp), str(path))           # whole or not at all
+        os.replace(tmp, str(path))  # whole or not at all
     except OSError:
-        try:
-            os.unlink(str(tmp))
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     return key
 
 
@@ -729,13 +1625,121 @@ def cache_dir(session_id: str):
 def _page_clean_turn(t, extra, mode):
     """`t` with its text and parts as a page shows them, so a summary cut from it cannot cut a
     secret in two and keep the half no pattern recognises."""
+
     def clean(s):
         return page_redact(s, extra, mode)[0]
-    return dict(t, text=clean(t["text"]), parts=[clean(p) for p in t.get("parts") or []])
+
+    return dict(
+        t, text=clean(t["text"]), parts=[clean(p) for p in t.get("parts") or []]
+    )
 
 
-def read_or_summarize(turn: dict, session_id: str, rebuild: bool = False,
-                      redact_extra=None, redact_mode: str = "full"):
+# Letters that print as nothing: the Hangul fillers, the braille blank, and the combining marks Unicode ignores by
+# default (the grapheme joiner, the Khmer inherent vowels, the Mongolian free variation selectors). With the control,
+# format, private-use, unassigned and separator categories, a cache made only of them holds no summary a person can
+# read (3.0.5).
+_BLANK_LETTERS = frozenset(
+    map(
+        chr,
+        (
+            0x115F,
+            0x1160,
+            0x3164,
+            0xFFA0,
+            0x2800,
+            0x034F,
+            0x17B4,
+            0x17B5,
+            0x180B,
+            0x180C,
+            0x180D,
+            0x180F,
+        ),
+    )
+)
+# Cn follows the Unicode table of the Python that runs: a character newer than that table reads as unassigned, so
+# a cache made only of such characters is summarized again every run (the page is the same).
+_BLANK_CATEGORIES = frozenset(("Cc", "Cf", "Co", "Cn", "Zs", "Zl", "Zp"))
+
+
+def _blank(ch):
+    """Whether ch prints as nothing: whitespace, a blank-looking letter, or a variation selector.
+    White space is in the blank categories too (Zs, Zl, Zp, Cc); str.isspace() only answers it sooner."""
+    if (
+        ch.isspace()
+        or ch in _BLANK_LETTERS
+        or unicodedata.category(ch) in _BLANK_CATEGORIES
+    ):
+        return True
+    o = ord(ch)
+    return 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF
+
+
+def _has_visible(text):
+    """Whether text holds a letter a person can see."""
+    return not all(_blank(ch) for ch in text)
+
+
+CACHE_READ_MAX = (
+    64 * 1024
+)  # bytes: a cached summary or decision is some hundred (120 characters), so this is generous
+
+
+def _read_small(path, limit=CACHE_READ_MAX):
+    """The bytes of the regular file at path when it holds at most `limit`, else None (missing, a link, a pipe, a
+    folder, a larger file). Opened without blocking and without following a link, so a pipe or a link left at a
+    cache place neither stops a run nor sends it to another file. Windows has neither flag: there the lstat
+    turns a link away, but a link swapped in between the lstat and the open is followed."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        if not stat.S_ISREG(
+            os.lstat(str(path)).st_mode
+        ):  # a link (Windows has no O_NOFOLLOW), pipe, folder
+            return None
+        fd = os.open(str(path), flags)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None
+            data = f.read(limit + 1)
+    except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
+def _read_text(path):
+    """The UTF-8 text _read_small gives, else None (bytes that are not UTF-8: a DRM encrypted them)."""
+    data = _read_small(path)
+    try:
+        return None if data is None else data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _read_cached(p):
+    """The summary cached at p, else at the same name with .txt, the name 3.0.2 and earlier wrote (their digests
+    carry summarizer version 2 or 3, so since version 4 no file of theirs is found).
+    None when neither holds one: missing, bytes that are not UTF-8 (a DRM encrypted them), or
+    nothing a person can see (a write that stopped early, or only blank-looking letters); the
+    turn is then summarized again (3.0.4, 3.0.5)."""
+    for cached in (p, p.with_name(p.stem + ".txt")):
+        text = (_read_text(cached) or "").strip()
+        if _has_visible(text):
+            return text
+    return None
+
+
+def read_or_summarize(
+    turn: dict,
+    session_id: str,
+    rebuild: bool = False,
+    redact_extra=None,
+    redact_mode: str = "full",
+):
     """Return (summary, cache_hit). Cache key includes the content hash AND the
     summarizer version (B-3), so changing the summarizer invalidates old entries.
     Cached text is always redacted (secret hygiene). It is cut from the redacted text (3.0.2).
@@ -743,23 +1747,21 @@ def read_or_summarize(turn: dict, session_id: str, rebuild: bool = False,
     digest = hashlib.sha256(
         (turn["text"] + "\x00s" + str(SUMMARIZER_VERSION)).encode()
     ).hexdigest()[:8]
-    try:                                          # ids come from the transcript: keep them in the cache
-        p = (cache_dir(_safe_name(turn.get("session") or session_id))
-             / f"{_safe_name(turn['uuid'])}-{digest}.txt")
-    except OSError as e:                          # no writable cache: summarize anyway
+    try:  # ids come from the transcript: keep them in the cache
+        p = (
+            cache_dir(_safe_name(turn.get("session") or session_id))
+            / f"{_safe_name(turn['uuid'])}-{digest}.md"
+        )
+    except OSError as e:  # no writable cache: summarize anyway
         _warn_once("_no_cache", f"cache unavailable ({e}); summaries are not cached")
         p = None
-    if p is not None and p.exists() and not rebuild:
-        try:
-            return p.read_text(encoding="utf-8").strip(), True
-        except (OSError, UnicodeDecodeError):
-            pass
+    cached = None if p is None or rebuild else _read_cached(p)
+    if cached is not None:
+        return cached, True
     redacted = summarize_turn(_page_clean_turn(turn, redact_extra, redact_mode))
     if p is not None:
         try:
-            fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(redacted)
+            _write_private(p, redacted)
         except OSError:
             pass
     return redacted, False
@@ -779,7 +1781,8 @@ _SENTINEL = "\x00%d\x00"
 _SENTINEL_RE = re.compile(r"\x00(\d+)\x00")
 _MD_CARVE = re.compile(
     r"`(?P<code>[^`\n]+)`"
-    r"|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)")
+    r"|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)"
+)
 _MD_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.S)
 _MD_DEL = re.compile(r"~~(?=\S)([^<]+?)(?<=\S)~~")
 _MD_ITAL = re.compile(r"(?<![*\w])\*(?=\S)([^*<\n]+?)(?<=\S)\*(?![*\w])")
@@ -802,7 +1805,8 @@ def _md_inline(escaped):
         else:
             stash.append(
                 '<a href="%s" target="_blank" rel="noopener noreferrer">%s</a>'
-                % (m.group("url"), m.group("label")))
+                % (m.group("url"), m.group("label"))
+            )
         return _SENTINEL % (len(stash) - 1)
 
     s = _MD_CARVE.sub(carve, escaped)
@@ -814,14 +1818,25 @@ def _md_inline(escaped):
 
 def _is_block_start(lines, i):
     line = lines[i]
-    if (_FENCE_RE.match(line) or _HEAD_RE.match(line) or _HR_RE.match(line)
-            or _QUOTE_RE.match(line) or _LIST_RE.match(line)):
+    if (
+        _FENCE_RE.match(line)
+        or _HEAD_RE.match(line)
+        or _HR_RE.match(line)
+        or _QUOTE_RE.match(line)
+        or _LIST_RE.match(line)
+    ):
         return True
-    # table: this line has a pipe AND the next line is a delimiter row
-    if ("|" in line and i + 1 < len(lines)
-            and "-" in lines[i + 1] and _TABLE_DELIM_RE.match(lines[i + 1])):
-        return True
-    return False
+    return _is_table_start(lines, i)
+
+
+def _is_table_start(lines, i):
+    """Whether lines[i] starts a table: it has a pipe AND the next line is a delimiter row."""
+    return bool(
+        "|" in lines[i]
+        and i + 1 < len(lines)
+        and "-" in lines[i + 1]
+        and _TABLE_DELIM_RE.match(lines[i + 1])
+    )
 
 
 def _render_table(lines, i):
@@ -833,11 +1848,88 @@ def _render_table(lines, i):
         i += 1
     thead = "".join("<th>%s</th>" % _md_inline(html.escape(c)) for c in header)
     body = "".join(
-        "<tr>%s</tr>" % "".join("<td>%s</td>" % _md_inline(html.escape(c))
-                                for c in r)
-        for r in rows)
-    return ("<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
-            % (thead, body)), i
+        "<tr>%s</tr>" % "".join("<td>%s</td>" % _md_inline(html.escape(c)) for c in r)
+        for r in rows
+    )
+    return (
+        "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (thead, body)
+    ), i
+
+
+def _md_fence(lines, i, fence):
+    """A code block from the fence at lines[i] to the first closing fence at least as long (or the end), and the
+    index past it."""
+    i += 1
+    buf = []
+    while i < len(lines):
+        mc = _FENCE_CLOSE_RE.match(lines[i])
+        if mc and len(mc.group(1)) >= len(fence):
+            i += 1
+            break
+        buf.append(lines[i])
+        i += 1
+    return "<pre><code>%s</code></pre>" % html.escape("\n".join(buf)), i
+
+
+def _md_quote(lines, i, depth):
+    """The blockquote of the run of `>` lines at lines[i], rendered one level deeper, and the index past it."""
+    buf = []
+    while i < len(lines) and _QUOTE_RE.match(lines[i]):
+        buf.append(re.sub(r"^\s*>\s?", "", lines[i]))
+        i += 1
+    return "<blockquote>%s</blockquote>" % render_markdown("\n".join(buf), depth + 1), i
+
+
+def _md_list(lines, i):
+    """The list of the run of list lines at lines[i] (ordered when the first is numbered; nested ones flatten),
+    and the index past it."""
+    tag = "ol" if re.match(r"^\s*\d+[.)]", lines[i]) else "ul"
+    items = []
+    while i < len(lines):
+        mli = _LIST_RE.match(lines[i])
+        if not mli:
+            break
+        items.append(_md_inline(html.escape(mli.group(3))))
+        i += 1
+    return "<%s>%s</%s>" % (tag, "".join("<li>%s</li>" % it for it in items), tag), i
+
+
+def _md_paragraph(lines, i):
+    """The paragraph that starts at lines[i] (at least that line: C-2, no endless loop), its lines joined with <br>
+    (N5: pre-wrap keeps leading spaces without a second break), and the index past it."""
+    buf = [lines[i]]
+    i += 1
+    while i < len(lines) and lines[i].strip() and not _is_block_start(lines, i):
+        buf.append(lines[i])
+        i += 1
+    return "<p>%s</p>" % "<br>".join(_md_inline(html.escape(b)) for b in buf), i
+
+
+def _md_block(lines, i, depth):
+    """The HTML of the block that starts at lines[i] (None for a blank line), and the index past it."""
+    line = lines[i]
+    mf = _FENCE_RE.match(line)
+    if mf:
+        return _md_fence(lines, i, mf.group(1))
+    mh = _HEAD_RE.match(line)
+    if mh:
+        hl = max(3, min(6, len(mh.group(1))))  # h3..h6 (avoid page-header clash)
+        return "<h%d>%s</h%d>" % (
+            hl,
+            _md_inline(html.escape(mh.group(2).strip())),
+            hl,
+        ), i + 1
+    if _HR_RE.match(line):
+        return "<hr>", i + 1
+    if _QUOTE_RE.match(line):
+        return _md_quote(lines, i, depth)
+    if _is_table_start(lines, i):
+        return _render_table(lines, i)
+    if _LIST_RE.match(line):
+        return _md_list(lines, i)
+    if not line.strip():
+        return None, i + 1
+    return _md_paragraph(lines, i)
 
 
 def render_markdown(text, depth=0):
@@ -846,79 +1938,12 @@ def render_markdown(text, depth=0):
     """
     if depth > _BLOCKQUOTE_MAX_DEPTH:
         return "<p>%s</p>" % _md_inline(html.escape(text))
-    text = _CTRL_RE.sub("", text)
-    lines = text.split("\n")
-    out = []
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i]
-        mf = _FENCE_RE.match(line)
-        if mf:
-            fence = mf.group(1)
-            i += 1
-            buf = []
-            while i < n:
-                mc = _FENCE_CLOSE_RE.match(lines[i])
-                if mc and len(mc.group(1)) >= len(fence):
-                    i += 1
-                    break
-                buf.append(lines[i])
-                i += 1
-            out.append("<pre><code>%s</code></pre>"
-                       % html.escape("\n".join(buf)))
-            continue
-        mh = _HEAD_RE.match(line)
-        if mh:
-            hl = max(3, min(6, len(mh.group(1))))     # h3..h6 (avoid page-header clash)
-            out.append("<h%d>%s</h%d>"
-                       % (hl, _md_inline(html.escape(mh.group(2).strip())), hl))
-            i += 1
-            continue
-        if _HR_RE.match(line):
-            out.append("<hr>")
-            i += 1
-            continue
-        if _QUOTE_RE.match(line):
-            buf = []
-            while i < n and _QUOTE_RE.match(lines[i]):
-                buf.append(re.sub(r"^\s*>\s?", "", lines[i]))
-                i += 1
-            out.append("<blockquote>%s</blockquote>"
-                       % render_markdown("\n".join(buf), depth + 1))
-            continue
-        if ("|" in line and i + 1 < n and "-" in lines[i + 1]
-                and _TABLE_DELIM_RE.match(lines[i + 1])):
-            tbl, i = _render_table(lines, i)
-            out.append(tbl)
-            continue
-        ml = _LIST_RE.match(line)
-        if ml:
-            ordered = bool(re.match(r"^\s*\d+[.)]", line))
-            tag = "ol" if ordered else "ul"
-            items = []
-            while i < n:
-                mli = _LIST_RE.match(lines[i])
-                if not mli:
-                    break
-                items.append(_md_inline(html.escape(mli.group(3))))
-                i += 1
-            out.append("<%s>%s</%s>"
-                       % (tag, "".join("<li>%s</li>" % it for it in items), tag))
-            continue
-        if not line.strip():
-            i += 1
-            continue
-        # paragraph: force-consume at least this line (C-2: no infinite loop)
-        buf = [line]
-        i += 1
-        while i < n and lines[i].strip() and not _is_block_start(lines, i):
-            buf.append(lines[i])
-            i += 1
-        # source newlines within a paragraph become <br> (N5). pre-wrap on the
-        # container preserves leading/aligned spaces without double-breaking,
-        # because we join with <br> and emit no literal newline between lines.
-        out.append("<p>%s</p>"
-                   % "<br>".join(_md_inline(html.escape(b)) for b in buf))
+    lines = _CTRL_RE.sub("", text).split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        block, i = _md_block(lines, i, depth)
+        if block is not None:
+            out.append(block)
     return "\n".join(out)
 
 
@@ -1118,8 +2143,13 @@ def _page_summary(t, summaries, session_id, rebuild, redact_extra, redact_mode):
     rules' (cached)."""
     if summaries is not None and t.get("uuid") in summaries:
         return summaries[t["uuid"]], None
-    return read_or_summarize(t, session_id, rebuild=rebuild,
-                             redact_extra=redact_extra, redact_mode=redact_mode)
+    return read_or_summarize(
+        t,
+        session_id,
+        rebuild=rebuild,
+        redact_extra=redact_extra,
+        redact_mode=redact_mode,
+    )
 
 
 def _reviewed_fold(t, summaries):
@@ -1131,102 +2161,149 @@ def _fmt_time(ts):
     return ts[11:16] if ts and len(ts) >= 16 else ""
 
 
-def render_rows(turns, session_id, redact_extra, redact_mode, rebuild,
-                open_details=False, markdown=True, all_sessions=False, summaries=None):
-    rows = []
-    last_date = None
-    last_session = None
-    cache_hits = 0
-    cache_total = 0
-    redact_counts = {}
-    open_attr = " open" if open_details else ""
+class _Rows:
+    """What render_rows carries from turn to turn: the rows so far, the redaction settings and what they hid by kind,
+    the open flag and markdown, the date and session the last pills showed, and the rule summaries' cache hits."""
 
-    def _red(text):
-        r, c = page_redact(text, extra=redact_extra, mode=redact_mode)
+    def __init__(self, redact_extra, redact_mode, open_details, markdown):
+        self.extra, self.mode, self.markdown = redact_extra, redact_mode, markdown
+        self.open_attr = " open" if open_details else ""
+        self.rows, self.counts = [], {}
+        self.last_date = self.last_session = None
+        self.hits = self.total = 0
+
+    def red(self, text):
+        r, c = page_redact(text, extra=self.extra, mode=self.mode)
         for k, v in c.items():
-            redact_counts[k] = redact_counts.get(k, 0) + v
+            self.counts[k] = self.counts.get(k, 0) + v
         return r
 
-    for t in turns:
-        ts = t.get("ts") or ""
-        # session-transition divider (--all-sessions)
-        if all_sessions and t.get("session") != last_session:
-            last_session = t.get("session")
-            name = html.escape(_red(t.get("session_name") or last_session or "session"))
-            rows.append('<div class="day" data-mark="%s">'
-                        '<span class="pill pill-session">%s</span></div>'
-                        % (name, name))
-            last_date = None
-        if ts:
-            d = ts[:10]
-            if d != last_date:
-                rows.append('<div class="day" data-mark="%s">'
-                            '<span class="pill pill-date">%s</span></div>'
-                            % (html.escape(d), html.escape(d)))
-                last_date = d
-        time_hm = html.escape(_fmt_time(ts))
-        role = t["role"]
 
-        if role == "mark":
-            rows.append('<div class="day"><span class="pill pill-compact">'
-                        '⋯ 이전 대화 요약(compaction) ⋯</span></div>')
-            continue
+def _pills(rs, t, all_sessions):
+    """The session pill (--all-sessions, when the session changes) and the date pill (when the day changes) before
+    turn `t`."""
+    if all_sessions and t.get("session") != rs.last_session:
+        rs.last_session = t.get("session")
+        name = html.escape(
+            rs.red(t.get("session_name") or rs.last_session or "session")
+        )
+        rs.rows.append(
+            '<div class="day" data-mark="%s">'
+            '<span class="pill pill-session">%s</span></div>' % (name, name)
+        )
+        rs.last_date = None
+    ts = t.get("ts") or ""
+    if ts:
+        d = ts[:10]
+        if d != rs.last_date:
+            rs.rows.append(
+                '<div class="day" data-mark="%s">'
+                '<span class="pill pill-date">%s</span></div>'
+                % (html.escape(d), html.escape(d))
+            )
+            rs.last_date = d
 
-        if role == "user":
-            red = _red(t["text"])
-            if len(red) > USER_FOLD:
-                reviewed = _reviewed_fold(t, summaries)
-                summary = html.escape(_red(reviewed) if reviewed else user_fold_summary(red))
-                body = render_body(red, markdown=markdown)
-                rows.append(
-                    '<div class="row me"><span class="time">%s</span>'
-                    '<div class="bubble"><details%s>'
-                    '<summary><span class="sum">%s</span></summary>'
-                    '<div class="detail">%s</div></details></div></div>'
-                    % (time_hm, open_attr, summary, body))
-            else:
-                rows.append(
-                    '<div class="row me"><span class="time">%s</span>'
-                    '<div class="bubble"><div class="plain">%s</div></div></div>'
-                    % (time_hm, render_body(red, markdown=markdown)))
-            continue
 
-        # assistant or agent bubble
-        summary, hit = _page_summary(t, summaries, session_id, rebuild,
-                                     redact_extra, redact_mode)
-        if hit is not None:
-            cache_total += 1
-            cache_hits += bool(hit)
-        esc_sum = html.escape(_red(summary))
-        detail_body = render_body(_red(t["text"]), markdown=markdown)
-
-        tools_html = ""
-        if t.get("tools"):
-            ts_list = ", ".join(f"{_hide_keywords(k, redact_extra)}×{v}"
-                                for k, v in sorted(t["tools"].items()))
-            total = sum(t["tools"].values())
-            tools_html = ('<div class="tools">🔧 도구 %d건: %s</div>'
-                          % (total, html.escape(ts_list)))
-
-        if role == "agent":
-            who = html.escape(_red(t.get("agent_from") or "agent"))
-            avatar = "🤝"
-            from_line = '<div class="from">%s</div>' % who
-            row_cls = "row bot agent"
-        else:
-            avatar = "C"
-            from_line = ""
-            row_cls = "row bot"
-
-        rows.append(
-            '<div class="%s"><div class="avatar%s">%s</div>'
+def _user_row(rs, t, summaries, time_hm):
+    """A user bubble: plain, or folded under a summary (the reviewer's, else cut from it) past USER_FOLD."""
+    red = rs.red(t["text"])
+    if len(red) > USER_FOLD:
+        reviewed = _reviewed_fold(t, summaries)
+        summary = html.escape(rs.red(reviewed) if reviewed else user_fold_summary(red))
+        body = render_body(red, markdown=rs.markdown)
+        return (
+            '<div class="row me"><span class="time">%s</span>'
             '<div class="bubble"><details%s>'
             '<summary><span class="sum">%s</span></summary>'
-            '<div class="detail">%s%s%s</div></details></div>'
-            '<span class="time">%s</span></div>'
-            % (row_cls, " agent" if role == "agent" else "", avatar,
-               open_attr, esc_sum, from_line, detail_body, tools_html, time_hm))
-    return rows, redact_counts, cache_hits, cache_total
+            '<div class="detail">%s</div></details></div></div>'
+            % (time_hm, rs.open_attr, summary, body)
+        )
+    return (
+        '<div class="row me"><span class="time">%s</span>'
+        '<div class="bubble"><div class="plain">%s</div></div></div>'
+        % (time_hm, render_body(red, markdown=rs.markdown))
+    )
+
+
+def _tools_line(tools, redact_extra):
+    """The `🔧 도구 N건` line of a bot bubble ("" without tools), the --redact-extra keywords hidden in the names."""
+    if not tools:
+        return ""
+    ts_list = ", ".join(
+        f"{_hide_keywords(k, redact_extra)}×{v}" for k, v in sorted(tools.items())
+    )
+    return '<div class="tools">🔧 도구 %d건: %s</div>' % (
+        sum(tools.values()),
+        html.escape(ts_list),
+    )
+
+
+def _bot_row(rs, t, summary, time_hm):
+    """An assistant or agent bubble: the summary, the details (body, tools) and, for an agent, who sent it."""
+    esc_sum = html.escape(rs.red(summary))
+    detail_body = render_body(rs.red(t["text"]), markdown=rs.markdown)
+    tools_html = _tools_line(t.get("tools"), rs.extra)
+    role = t["role"]
+    if role == "agent":
+        who = html.escape(rs.red(t.get("agent_from") or "agent"))
+        avatar, from_line, row_cls = (
+            "🤝",
+            '<div class="from">%s</div>' % who,
+            "row bot agent",
+        )
+    else:
+        avatar, from_line, row_cls = "C", "", "row bot"
+    return (
+        '<div class="%s"><div class="avatar%s">%s</div>'
+        '<div class="bubble"><details%s>'
+        '<summary><span class="sum">%s</span></summary>'
+        '<div class="detail">%s%s%s</div></details></div>'
+        '<span class="time">%s</span></div>'
+        % (
+            row_cls,
+            " agent" if role == "agent" else "",
+            avatar,
+            rs.open_attr,
+            esc_sum,
+            from_line,
+            detail_body,
+            tools_html,
+            time_hm,
+        )
+    )
+
+
+def render_rows(
+    turns,
+    session_id,
+    redact_extra,
+    redact_mode,
+    rebuild,
+    open_details=False,
+    markdown=True,
+    all_sessions=False,
+    summaries=None,
+):
+    rs = _Rows(redact_extra, redact_mode, open_details, markdown)
+    for t in turns:
+        _pills(rs, t, all_sessions)
+        time_hm = html.escape(_fmt_time(t.get("ts") or ""))
+        if t["role"] == "mark":
+            rs.rows.append(
+                '<div class="day"><span class="pill pill-compact">'
+                "⋯ 이전 대화 요약(compaction) ⋯</span></div>"
+            )
+        elif t["role"] == "user":
+            rs.rows.append(_user_row(rs, t, summaries, time_hm))
+        else:
+            summary, hit = _page_summary(
+                t, summaries, session_id, rebuild, redact_extra, redact_mode
+            )
+            if hit is not None:
+                rs.total += 1
+                rs.hits += bool(hit)
+            rs.rows.append(_bot_row(rs, t, summary, time_hm))
+    return rs.rows, rs.counts, rs.hits, rs.total
 
 
 _TAG_RE = re.compile(r"<[^>]*>")
@@ -1246,10 +2323,34 @@ def _residual_secrets(rows_html):
 
 # ---------------------------------------------------------------- Self-verify (F-1)
 _VOID = frozenset(
-    "area base br col embed hr img input link meta param source track wbr".split())
-_VERIFY_TAGS = ("details", "div", "p", "ul", "ol", "li", "table", "thead",
-                "tbody", "tr", "th", "td", "blockquote", "pre", "code",
-                "strong", "em", "del", "a", "summary", "h3", "h4", "h5", "h6")
+    "area base br col embed hr img input link meta param source track wbr".split()
+)
+_VERIFY_TAGS = (
+    "details",
+    "div",
+    "p",
+    "ul",
+    "ol",
+    "li",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "blockquote",
+    "pre",
+    "code",
+    "strong",
+    "em",
+    "del",
+    "a",
+    "summary",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+)
 
 
 class _BalanceParser(HTMLParser):
@@ -1294,8 +2395,12 @@ def self_verify(html_text: str):
     errs = []
     # strip script/style so their bodies aren't parsed as markup (avoids
     # false <a> counts from inline JS like `top<a-8`)
-    markup = re.sub(r"<script\b[\s\S]*?</script>|<style\b[\s\S]*?</style>",
-                    "", html_text, flags=re.I)
+    markup = re.sub(
+        r"<script\b[\s\S]*?</script>|<style\b[\s\S]*?</style>",
+        "",
+        html_text,
+        flags=re.I,
+    )
     try:
         HTMLParser().feed(html_text)
     except Exception as e:
@@ -1319,9 +2424,11 @@ def self_verify(html_text: str):
         errs.append("external script src found")
     # Event-handler attributes are detected via the parser (real tag attrs),
     # NOT a text regex — escaped content like `&lt;img onerror=` is inert text.
-    for marker, ph in (("<title>{{TITLE}}</title>", "{{TITLE}}"),
-                       ("<h1>{{HEADER_TITLE}}</h1>", "{{HEADER_TITLE}}"),
-                       ('id="now">{{DATE_RANGE}}</div>', "{{DATE_RANGE}}")):
+    for marker, ph in (
+        ("<title>{{TITLE}}</title>", "{{TITLE}}"),
+        ("<h1>{{HEADER_TITLE}}</h1>", "{{HEADER_TITLE}}"),
+        ('id="now">{{DATE_RANGE}}</div>', "{{DATE_RANGE}}"),
+    ):
         if marker in html_text:
             errs.append(f"unsubstituted template placeholder: {ph}")
     return errs
@@ -1360,10 +2467,14 @@ def _write_private(path, text):
     is never followed, and it is removed when the write fails."""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                _lone_to_fffd(text)
+            )  # a title or a file name may still bring one: UTF-8 cannot hold it
         os.replace(tmp, str(path))
     except BaseException:
         try:
@@ -1371,6 +2482,15 @@ def _write_private(path, text):
         except OSError:
             pass
         raise
+
+
+def _write_text_lf(path, text):
+    """Write `text` to `path` as UTF-8 with LF line ends on every OS. Text mode on Windows
+    would write CRLF, so the same transcript would give a different page there."""
+    with open(str(path), "w", encoding="utf-8", newline="\n") as f:
+        f.write(
+            _lone_to_fffd(text)
+        )  # a title or a file name may still bring one: UTF-8 cannot hold it
 
 
 def _safe_name(s):
@@ -1382,19 +2502,28 @@ def _safe_name(s):
 def _decision_context(why, keeps):
     """What a cached decision rests on beside the text: the rules' call on the turn (a
     `keep: null` defers to it) and the keep flags the reviewer was told to honour."""
-    return "|".join([why or "", str(keeps.get("keep_trivia") is True),
-                     str(keeps.get("keep_tool_only") is True)])
+    return "|".join(
+        [
+            why or "",
+            str(keeps.get("keep_trivia") is True),
+            str(keeps.get("keep_tool_only") is True),
+        ]
+    )
 
 
 def _llm_digest(redacted_text, context):
     """The decision cache key: the text with the page's patterns only (as 3.0.1 keyed it, so
     no turn is reviewed again for 3.0.2), the cache version and what the decision rests on."""
-    return hashlib.sha256((redacted_text + "\x00llm" + str(LLM_CACHE_VERSION)
-                           + "\x00" + context).encode()).hexdigest()[:12]
+    return hashlib.sha256(
+        (redacted_text + "\x00llm" + str(LLM_CACHE_VERSION) + "\x00" + context).encode()
+    ).hexdigest()[:12]
 
 
 def _llm_cache_path(turn_id, session, digest):
-    return cache_dir(_safe_name(session)) / f"{_safe_name(turn_id)}-{_safe_name(digest)}-llm.json"
+    return (
+        cache_dir(_safe_name(session))
+        / f"{_safe_name(turn_id)}-{_safe_name(digest)}-llm.json"
+    )
 
 
 def read_llm_cache(turn_id, session, digest):
@@ -1403,29 +2532,36 @@ def read_llm_cache(turn_id, session, digest):
     null: the reviewer left the turn to the rules."""
     try:
         path = _llm_cache_path(turn_id, session, digest)
-    except OSError as e:                          # no cache folder (a read-only HOME, say)
-        _warn_once("_no_llm_cache", f"reviewer decision cache unavailable ({e}); "
-                   "every turn is reviewed")
+    except OSError as e:  # no cache folder (a read-only HOME, say)
+        _warn_once(
+            "_no_llm_cache",
+            f"reviewer decision cache unavailable ({e}); every turn is reviewed",
+        )
         return None
     try:
-        got = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        got = json.loads(_read_text(path) or "")
+    except (ValueError, RecursionError):
         return None
     if not isinstance(got, dict):
         return None
     keep, summary = got.get("keep"), got.get("summary")
     if not (_is_keep(keep) and _is_summary(summary)):
         return None
-    return {"keep": keep, "summary": summary}
+    return {"keep": keep, "summary": _lone_to_fffd(summary)}
 
 
 def write_llm_cache(turn_id, session, digest, keep, summary):
     try:
-        _write_private(_llm_cache_path(turn_id, session, digest),
-                       json.dumps({"keep": keep, "summary": summary}, ensure_ascii=False))
+        _write_private(
+            _llm_cache_path(turn_id, session, digest),
+            json.dumps({"keep": keep, "summary": summary}, ensure_ascii=False),
+        )
     except OSError as e:
-        _warn_once("_no_llm_cache_write", f"reviewer decisions not cached ({e}); the next "
-                   "run reviews this run's turns again (decisions cached before still apply)")
+        _warn_once(
+            "_no_llm_cache_write",
+            f"reviewer decisions not cached ({e}); the next "
+            "run reviews this run's turns again (decisions cached before still apply)",
+        )
 
 
 def heuristic_drops(turns, args):
@@ -1464,8 +2600,11 @@ def _preview(text):
     if len(text) <= PREVIEW_HEAD + PREVIEW_TAIL + 200:
         return text, False
     cut = len(text) - PREVIEW_HEAD - PREVIEW_TAIL
-    return (text[:PREVIEW_HEAD].rstrip() + f"\n\n[중간 {cut}자 생략]\n\n"
-            + text[-PREVIEW_TAIL:].lstrip()), True
+    return (
+        text[:PREVIEW_HEAD].rstrip()
+        + f"\n\n[중간 {cut}자 생략]\n\n"
+        + text[-PREVIEW_TAIL:].lstrip()
+    ), True
 
 
 def _public_counts(counts):
@@ -1492,52 +2631,91 @@ def _rule_summary(t, red, args):
 def _redacted_turn(t, extra):
     """`t` with its text and parts fully redacted, so a summary cut from it cannot cut a
     secret in two and keep the half no pattern recognises."""
+
     def clean(s):
         return review_redact(s, extra)[0]
-    return dict(t, text=clean(t["text"]), parts=[clean(p) for p in t.get("parts") or []])
+
+    return dict(
+        t, text=clean(t["text"]), parts=[clean(p) for p in t.get("parts") or []]
+    )
 
 
 def _review_view(t, red, args):
     """What a reviewer reads beside the preview: the rules' summary and the agent's
     name, fully redacted (the page's copies may be masked)."""
     if t["role"] in ("assistant", "agent"):
-        summary = review_redact(summarize_turn(_redacted_turn(t, args.redact_extra)),
-                                args.redact_extra)[0]
+        summary = review_redact(
+            summarize_turn(_redacted_turn(t, args.redact_extra)), args.redact_extra
+        )[0]
     elif t["role"] == "user" and len(red) > USER_FOLD:
         summary = user_fold_summary(review_redact(t["text"], args.redact_extra)[0])
     else:
         summary = None
-    who = review_redact(t["agent_from"], args.redact_extra)[0] if t.get("agent_from") else None
+    who = (
+        review_redact(t["agent_from"], args.redact_extra)[0]
+        if t.get("agent_from")
+        else None
+    )
     return {"summary": summary, "agent_from": who}
 
 
 def _pack_turn(n, t, tid, why, session_id, args, counts):
     """One turn of the pack under its final id `tid` (the text as the page shows it, the rules'
     decision, the reviewer's slot), and the reviewer's view of it. The cached decision keys on
-    the text with the page's patterns only (`llm_key`), as 3.0.1 did."""
+    the text with the page's patterns only (`llm_key`), as 3.0.1 did, its split secrets joined first: a key
+    found only once joined keys anew, so no decision 3.0.8 or earlier cached for such a turn is read (it is
+    reviewed once more)."""
     red, found = page_redact(t["text"], extra=args.redact_extra, mode=args.redact_mode)
     for k, v in found.items():
         counts[k] = counts.get(k, 0) + v
     hit = any(name in found for name, _ in REVIEW_SECRET_PATTERNS)
-    key_text = redact(t["text"], extra=args.redact_extra, mode=args.redact_mode)[0] if hit else red
+    key_text = (
+        redact(
+            _rejoin_secrets(t["text"], args.redact_extra),
+            extra=args.redact_extra,
+            mode=args.redact_mode,
+        )[0]
+        if hit
+        else red
+    )
     preview, clipped = _preview(review_redact(t["text"], args.redact_extra)[0])
     session = t.get("session") or session_id
     context = _decision_context(why, _keeps(args))
     llm_key = _llm_digest(key_text, context)
     cached = None if args.rebuild_summaries else read_llm_cache(tid, session, llm_key)
     view = _review_view(t, red, args)
-    turn = {"id": tid, "n": n, "role": t["role"], "ts": t.get("ts") or "",
-            "tools": dict(t.get("tools") or {}), "text": red, "llm_key": llm_key,
-            "redactions": _public_counts(found), "preview": preview, "clipped": clipped,
-            "rule": {"keep": why is None, "why": why,
-                     "summary": _rule_summary(t, red, args),
-                     "review_summary": view["summary"]},
-            "llm": dict(cached, cached=True) if cached else {"keep": None, "summary": None}}
+    turn = {
+        "id": tid,
+        "n": n,
+        "role": t["role"],
+        "ts": t.get("ts") or "",
+        "tools": dict(t.get("tools") or {}),
+        "text": red,
+        "llm_key": llm_key,
+        "redactions": _public_counts(found),
+        "preview": preview,
+        "clipped": clipped,
+        "rule": {
+            "keep": why is None,
+            "why": why,
+            "summary": _rule_summary(t, red, args),
+            "review_summary": view["summary"],
+        },
+        "llm": dict(cached, cached=True) if cached else {"keep": None, "summary": None},
+    }
     if t.get("meta"):
         turn["meta"] = True
+    if t["role"] == "user" and _bang_output(t["text"]):
+        turn["bang_output"] = (
+            True  # for the dropped-turn WARN only: no part file carries it
+        )
     for k in ("session", "session_name", "agent_from"):
         if t.get(k):
-            turn[k] = t[k] if k == "session" else page_redact(t[k], args.redact_extra, args.redact_mode)[0]
+            turn[k] = (
+                t[k]
+                if k == "session"
+                else page_redact(t[k], args.redact_extra, args.redact_mode)[0]
+            )
     return turn, view
 
 
@@ -1558,7 +2736,7 @@ def _split_even(items, size):
     if not items:
         return []
     step = -(-len(items) // -(-len(items) // size))
-    return [items[k:k + step] for k in range(0, len(items), step)]
+    return [items[k : k + step] for k in range(0, len(items), step)]
 
 
 def _decisions_name(part_path):
@@ -1573,8 +2751,12 @@ def _clear_parts(pack_path):
     prefix = pack_path.stem + ".part-"
     samples = f"{pack_path.stem}.reviewer-input.json"
     try:
-        olds = [p for p in pack_path.parent.iterdir()
-                if (p.name.startswith(prefix) and p.name.endswith(".json")) or p.name == samples]
+        olds = [
+            p
+            for p in pack_path.parent.iterdir()
+            if (p.name.startswith(prefix) and p.name.endswith(".json"))
+            or p.name == samples
+        ]
     except OSError:
         return []
     failed = []
@@ -1595,72 +2777,129 @@ def _hide_keywords(s, extra):
 
 def _keeps(args):
     """The keep flags the reviewers must honour: with them, the rules keep those turns."""
-    return {"keep_trivia": not args.drop_trivia, "keep_tool_only": not args.hide_tool_only}
+    return {
+        "keep_trivia": not args.drop_trivia,
+        "keep_tool_only": not args.hide_tool_only,
+    }
 
 
 def _sheet(k, of, part_path, group, args):
     """Part file `k`: the turns one reviewer reads, without the page-only fields."""
     turns = []
     for x, view in group:
-        y = {key: v for key, v in x.items()
-             if key not in ("text", "session", "session_name", "agent_from", "redactions", "llm_key")}
+        y = {
+            key: v
+            for key, v in x.items()
+            if key
+            not in (
+                "text",
+                "session",
+                "session_name",
+                "agent_from",
+                "redactions",
+                "llm_key",
+                "bang_output",
+            )
+        }
         y["rule"] = {k: v for k, v in x["rule"].items() if k != "review_summary"}
         y["rule"]["summary"] = view["summary"]
-        y["tools"] = {_hide_keywords(name, args.redact_extra): n for name, n in x["tools"].items()}
-        if x["llm"].get("summary"):               # cached: redacted for the page, maybe masked
+        y["tools"] = {
+            _hide_keywords(name, args.redact_extra): n for name, n in x["tools"].items()
+        }
+        if x["llm"].get("summary"):  # cached: redacted for the page, maybe masked
             s = _MASKED.sub("[REDACTED]", x["llm"]["summary"])
             y["llm"] = dict(x["llm"], summary=review_redact(s, args.redact_extra)[0])
         if view["agent_from"]:
             y["agent_from"] = view["agent_from"]
         turns.append(y)
-    return {"schema": REVIEW_PART_SCHEMA, "part": k, "of": of, **_keeps(args),
-            "decisions": _decisions_name(part_path), "turns": turns}
+    return {
+        "schema": REVIEW_PART_SCHEMA,
+        "part": k,
+        "of": of,
+        **_keeps(args),
+        "decisions": _decisions_name(part_path),
+        "turns": turns,
+    }
 
 
 def _pack_header(session_id, output, args, counts):
     """The pack's settings: what --apply-review renders with and the quality gate it runs."""
-    return {"schema": REVIEW_SCHEMA, "source": session_id, "output": str(output),
-            "title": args.title, "markdown": args.markdown, "open": args.open_details,
-            "redact_mode": args.redact_mode, "redact_extra": bool(args.redact_extra),
-            "all_sessions": bool(args.all_sessions), "redactions": _public_counts(counts),
-            **_keeps(args),
-            "gate": {"skip_reviewer": bool(args.skip_reviewer),
-                     "reviewer_output": args.reviewer_output,
-                     "reviewer_timeout": args.reviewer_timeout}}
+    return {
+        "schema": REVIEW_SCHEMA,
+        "source": session_id,
+        "output": str(output),
+        "title": args.title,
+        "markdown": args.markdown,
+        "open": args.open_details,
+        "redact_mode": args.redact_mode,
+        "redact_extra": bool(args.redact_extra),
+        "all_sessions": bool(args.all_sessions),
+        "redactions": _public_counts(counts),
+        **_keeps(args),
+        "gate": {
+            "skip_reviewer": bool(args.skip_reviewer),
+            "reviewer_output": args.reviewer_output,
+            "reviewer_timeout": args.reviewer_timeout,
+        },
+    }
 
 
 def _report_emit(pack_path, items, paths, groups):
     dropped = sum(1 for x in items if not x["rule"]["keep"])
     cached = sum(1 for x in items if x["llm"].get("cached"))
-    print(f"[lineage] review pack: {pack_path} (turns={len(items)} "
-          f"rule-dropped={dropped} cached={cached})", file=sys.stderr)
+    print(
+        f"[lineage] review pack: {pack_path} (turns={len(items)} "
+        f"rule-dropped={dropped} cached={cached})",
+        file=sys.stderr,
+    )
     for k, (p, g) in enumerate(zip(paths, groups), 1):
         todo = sum(1 for x, _ in g if not x["llm"].get("cached"))
-        print(f"[lineage] part {k}/{len(groups)}: {p} (to review: {todo}) "
-              f"-> {p.with_name(_decisions_name(p))}", file=sys.stderr)
-    print(f"[lineage] next: write each part's decisions, then "
-          f"--apply-review {pack_path}", file=sys.stderr)
+        print(
+            f"[lineage] part {k}/{len(groups)}: {p} (to review: {todo}) "
+            f"-> {p.with_name(_decisions_name(p))}",
+            file=sys.stderr,
+        )
+    print(
+        f"[lineage] next: write each part's decisions, then --apply-review {pack_path}",
+        file=sys.stderr,
+    )
 
 
 def emit_review(turns, drops, window, session_id, output, args):
     """Write the pack and one part file per reviewer; print them and the next step. A
     --reviewer-output that holds something other than a verdict list stops it here, before
     any reviewer runs: the gate would refuse it only after them."""
-    rop = pathlib.Path(args.reviewer_output) if args.reviewer_output and not args.skip_reviewer else None
+    rop = (
+        pathlib.Path(args.reviewer_output)
+        if args.reviewer_output and not args.skip_reviewer
+        else None
+    )
     if rop is not None and rop.exists() and not _is_verdict_file(rop):
-        _bad(f"{rop} is there and is not a verdict list; give a --reviewer-output that does not exist yet")
+        _bad(
+            f"{rop} is there and is not a verdict list; give a --reviewer-output that does not exist yet"
+        )
         return 2
     pack_path = pathlib.Path(args.emit_review)
     counts, pairs = {}, []
     for n, (i, tid) in enumerate(zip(window, _final_ids(turns, window)), 1):
-        pairs.append(_pack_turn(n, turns[i], tid, drops.get(i), session_id, args, counts))
+        pairs.append(
+            _pack_turn(n, turns[i], tid, drops.get(i), session_id, args, counts)
+        )
     groups = _split_even(pairs, REVIEW_PART)
-    paths = [pack_path.with_name(f"{pack_path.stem}.part-{k}.json")
-             for k in range(1, len(groups) + 1)]
+    paths = [
+        pack_path.with_name(f"{pack_path.stem}.part-{k}.json")
+        for k in range(1, len(groups) + 1)
+    ]
     pack = _pack_header(session_id, _with_timestamp_suffix(output), args, counts)
-    pack["parts"] = [{"part": k, "file": p.name, "decisions": _decisions_name(p),
-                      "ids": [x["id"] for x, _ in g]}
-                     for k, (p, g) in enumerate(zip(paths, groups), 1)]
+    pack["parts"] = [
+        {
+            "part": k,
+            "file": p.name,
+            "decisions": _decisions_name(p),
+            "ids": [x["id"] for x, _ in g],
+        }
+        for k, (p, g) in enumerate(zip(paths, groups), 1)
+    ]
     pack["turns"] = [x for x, _ in pairs]
     stuck = _clear_parts(pack_path)
     if stuck:
@@ -1669,8 +2908,12 @@ def emit_review(turns, drops, window, session_id, output, args):
     try:
         _write_private(pack_path, json.dumps(pack, ensure_ascii=False, indent=1))
         for k, (p, g) in enumerate(zip(paths, groups), 1):
-            _write_private(p, json.dumps(_sheet(k, len(groups), p, g, args),
-                                         ensure_ascii=False, indent=1))
+            _write_private(
+                p,
+                json.dumps(
+                    _sheet(k, len(groups), p, g, args), ensure_ascii=False, indent=1
+                ),
+            )
     except OSError as e:
         _bad(f"cannot write the review pack: {e}")
         return 2
@@ -1679,24 +2922,34 @@ def emit_review(turns, drops, window, session_id, output, args):
 
 
 def _is_pack_turn(x):
-    return (isinstance(x, dict) and isinstance(x.get("id"), str)
-            and x.get("role") in ("user", "assistant", "agent", "mark")
-            and isinstance(x.get("text"), str) and isinstance(x.get("llm_key"), str)
-            and isinstance(x.get("rule"), dict) and isinstance(x["rule"].get("keep"), bool)
-            and _is_summary(x["rule"].get("summary"))
-            and isinstance(x.get("llm"), dict) and _is_keep(x["llm"].get("keep"))
-            and _is_summary(x["llm"].get("summary")))
+    return (
+        isinstance(x, dict)
+        and isinstance(x.get("id"), str)
+        and x.get("role") in ("user", "assistant", "agent", "mark")
+        and isinstance(x.get("text"), str)
+        and isinstance(x.get("llm_key"), str)
+        and isinstance(x.get("rule"), dict)
+        and isinstance(x["rule"].get("keep"), bool)
+        and _is_summary(x["rule"].get("summary"))
+        and isinstance(x.get("llm"), dict)
+        and _is_keep(x["llm"].get("keep"))
+        and _is_summary(x["llm"].get("summary"))
+    )
 
 
 def _load_pack(path):
     try:
-        pack = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError) as e:
+        pack = _without_lone_surrogates(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:
         return _bad(f"cannot read review pack {path}: {e}")
     if not isinstance(pack, dict) or pack.get("schema") != REVIEW_SCHEMA:
-        return _bad(f"{path} is not a {REVIEW_SCHEMA} pack (made by another lineage version? "
-                    "run --emit-review again)")
-    if not isinstance(pack.get("turns"), list) or not all(map(_is_pack_turn, pack["turns"])):
+        return _bad(
+            f"{path} is not a {REVIEW_SCHEMA} pack (made by another lineage version? "
+            "run --emit-review again)"
+        )
+    if not isinstance(pack.get("turns"), list) or not all(
+        map(_is_pack_turn, pack["turns"])
+    ):
         return _bad(f"{path}: malformed turns")
     return pack
 
@@ -1704,8 +2957,11 @@ def _load_pack(path):
 def _decision_files(pack_path, pack, explicit):
     """The parts' decisions files that exist beside the pack, then each --decisions.
     Those beside the pack are made 0600: the session wrote them with its own umask."""
-    beside = [pack_path.with_name(p["decisions"]) for p in pack.get("parts") or []
-              if isinstance(p, dict) and isinstance(p.get("decisions"), str)]
+    beside = [
+        pack_path.with_name(p["decisions"])
+        for p in pack.get("parts") or []
+        if isinstance(p, dict) and isinstance(p.get("decisions"), str)
+    ]
     files, seen = [], set()
     for f in [f for f in beside if f.exists()] + [pathlib.Path(f) for f in explicit]:
         if os.path.realpath(str(f)) not in seen:
@@ -1721,15 +2977,31 @@ def _decision_files(pack_path, pack, explicit):
 
 # Keys of a part file's turns: a list of objects carrying one is the reviewer quoting its
 # input, not its answer.
-_PART_TURN_KEYS = frozenset({"n", "role", "ts", "tools", "text", "preview", "clipped",
-                             "rule", "llm", "meta", "agent_from"})
+_PART_TURN_KEYS = frozenset(
+    {
+        "n",
+        "role",
+        "ts",
+        "tools",
+        "text",
+        "preview",
+        "clipped",
+        "rule",
+        "llm",
+        "meta",
+        "agent_from",
+    }
+)
 
 
 def _is_answer(d):
     """A decision, extra keys and all; a part turn quoted back (its keep and summary sit
     under rule and llm, not on top) is not one."""
-    return (isinstance(d, dict) and "id" in d
-            and ("keep" in d or "summary" in d or not _PART_TURN_KEYS & d.keys()))
+    return (
+        isinstance(d, dict)
+        and "id" in d
+        and ("keep" in d or "summary" in d or not _PART_TURN_KEYS & d.keys())
+    )
 
 
 def _decisions_text(text):
@@ -1748,8 +3020,10 @@ def _decisions_text(text):
     # and only so many starts (each failed try parses up to the nesting limit)
     for k, m in enumerate(re.finditer(r"\[(?=\s*[{\]])", text)):
         if k == DECISIONS_TRIES:
-            raise ValueError(f"more than {DECISIONS_TRIES} places a list may start; "
-                             "write the bare JSON array")
+            raise ValueError(
+                f"more than {DECISIONS_TRIES} places a list may start; "
+                "write the bare JSON array"
+            )
         try:
             got, _ = decoder.raw_decode(text, m.start())
         except (ValueError, RecursionError):
@@ -1767,8 +3041,12 @@ def _decisions_text(text):
 
 def _decision_problem(d):
     """Why item `d` of a decisions file is not a decision, or ""."""
-    if not (isinstance(d, dict) and isinstance(d.get("id"), str)
-            and _is_keep(d.get("keep")) and _is_summary(d.get("summary"))):
+    if not (
+        isinstance(d, dict)
+        and isinstance(d.get("id"), str)
+        and _is_keep(d.get("keep"))
+        and _is_summary(d.get("summary"))
+    ):
         return 'want {"id": str, "keep": true|false|null, "summary": str|null}'
     if not _is_answer(d):
         return "a turn of the part file, not a decision"
@@ -1793,13 +3071,20 @@ def _load_decisions(files):
             why = _decision_problem(d)
             if why:
                 return _bad(f"{f}[{k}]: {why}")
-            cur = merged.setdefault(d["id"], {})
+            cur = merged.setdefault(
+                _lone_to_fffd(d["id"]), {}
+            )  # a model's JSON may hold a lone surrogate
             for key in ("keep", "summary"):
                 if d.get(key) is not None:
-                    cur[key] = d[key]
-        if items and all(d.get("keep") is None and d.get("summary") is None for d in items):
-            print(f"[lineage] WARN: {f}: all {len(items)} decisions are null; the rules "
-                  "decide those turns", file=sys.stderr)
+                    cur[key] = _lone_to_fffd(d[key])
+        if items and all(
+            d.get("keep") is None and d.get("summary") is None for d in items
+        ):
+            print(
+                f"[lineage] WARN: {f}: all {len(items)} decisions are null; the rules "
+                "decide those turns",
+                file=sys.stderr,
+            )
     return merged
 
 
@@ -1810,7 +3095,8 @@ def _clean_summary(s, extra, mode):
     next reviewer and the gate's critic, so no part of a key may stay in it."""
     pre, n = review_redact(" ".join(s.split()), extra)
     red, found = redact(pre, extra=extra, mode=mode)
-    return (_cut(red, SUMMARY_MAX) or None), n + sum(found.values())
+    cut = _cut(red, SUMMARY_MAX)
+    return (cut if _has_visible(cut) else None), n + sum(found.values())
 
 
 def _warn_coverage(pack, decided):
@@ -1823,9 +3109,11 @@ def _warn_coverage(pack, decided):
         todo = [i for i in ids if i not in decided]
         if todo:
             more = ", ..." if len(todo) > 3 else ""
-            print(f"[lineage] WARN: part {p.get('part')}: {len(todo)}/{len(ids)} turns "
-                  f"undecided ({', '.join(map(str, todo[:3]))}{more}); the rules decide them",
-                  file=sys.stderr)
+            print(
+                f"[lineage] WARN: part {p.get('part')}: {len(todo)}/{len(ids)} turns "
+                f"undecided ({', '.join(map(str, todo[:3]))}{more}); the rules decide them",
+                file=sys.stderr,
+            )
 
 
 def _reviewer_summary(x, d, args, stats):
@@ -1837,8 +3125,11 @@ def _reviewer_summary(x, d, args, stats):
     s, n = _clean_summary(raw, args.redact_extra, args.redact_mode)
     if n:
         stats["hidden"] += n
-        print(f"[lineage] WARN: the reviewer summary for {x['id']} held {n} "
-              "secret-like string(s); redacted", file=sys.stderr)
+        print(
+            f"[lineage] WARN: the reviewer summary for {x['id']} held {n} "
+            "secret-like string(s); redacted",
+            file=sys.stderr,
+        )
     return s
 
 
@@ -1846,7 +3137,8 @@ def _show(x, llm_summary, turns, summaries, stats, prior):
     """Put kept pack turn `x` on the page with the summary it shows; `prior` adds up what
     --emit-review redacted."""
     shows = x["role"] in ("assistant", "agent") or (
-        x["role"] == "user" and len(x["text"]) > USER_FOLD)
+        x["role"] == "user" and len(x["text"]) > USER_FOLD
+    )
     if llm_summary and not shows:
         stats["ignored"] += 1
     summary = (llm_summary if shows else None) or x["rule"].get("summary")
@@ -1857,14 +3149,23 @@ def _show(x, llm_summary, turns, summaries, stats, prior):
         if isinstance(v, int):
             prior[k] = prior.get(k, 0) + v
     # what the gate's critic reads: the reviewer's summary, else the rules' cut from the
-    # fully redacted text (the page's is cut first and may keep half a secret)
+    # fully redacted text (the page's may hold a --redact-mode mask: 4 + 4 characters of a value)
     sample = (llm_summary if shows else None) or x["rule"].get("review_summary")
-    turns.append({"uuid": x["id"], "role": x["role"], "text": x["text"],
-                  "ts": x.get("ts") or None, "tools": dict(x.get("tools") or {}),
-                  "parts": [], "session": x.get("session"),
-                  "session_name": x.get("session_name"),
-                  "agent_from": x.get("agent_from"), "preview": x.get("preview"),
-                  "sample_summary": sample})
+    turns.append(
+        {
+            "uuid": x["id"],
+            "role": x["role"],
+            "text": x["text"],
+            "ts": x.get("ts") or None,
+            "tools": dict(x.get("tools") or {}),
+            "parts": [],
+            "session": x.get("session"),
+            "session_name": x.get("session_name"),
+            "agent_from": x.get("agent_from"),
+            "preview": x.get("preview"),
+            "sample_summary": sample,
+        }
+    )
 
 
 def _kept_by_flag(pack, x):
@@ -1879,26 +3180,61 @@ def _kept_by_flag(pack, x):
     return pack.get("keep_tool_only") is True and tool_only
 
 
+def _bang_output(text):
+    """Whether `text` is the record Claude Code writes after a `!` command and nothing else (2.1.304, no isMeta): a
+    <bash-stdout> block then a <bash-stderr> block, or one <bash-stderr> block when the command failed. String checks
+    only, linear in the text: a pattern repeating the blocks could take exponential time on many closing tags."""
+    if text.startswith("<bash-stdout>"):
+        return "</bash-stdout><bash-stderr>" in text and text.endswith("</bash-stderr>")
+    return text.startswith("<bash-stderr>") and text.endswith("</bash-stderr>")
+
+
+def _typed_by_user(x):
+    """Whether pack turn `x` holds words the user typed: a user turn the rules keep that is neither a body the
+    harness injected (meta) nor what Claude Code writes after a `!` command (bang_output, judged on the text before
+    redaction: a hidden value at the end of the output takes the closing tags with it)."""
+    return (
+        x["role"] == "user"
+        and x["rule"]["keep"]
+        and not x.get("meta")
+        and x.get("bang_output") is not True
+    )
+
+
 def _review_result(pack, merged, args):
     """(turns to render, their summaries, cache writes, counts, prior redactions, the ids of
     turns the user typed that the reviewers dropped) from the pack and the decisions: a
     reviewer's value first, then the pack's cached one, then the rules'. A keep flag outranks
     a reviewer's `false`; the cache still gets what was said."""
     turns, summaries, writes, prior, typed = [], {}, [], {}, []
-    stats = {"restored": 0, "dropped": 0, "reviewer": 0, "rule": 0, "ignored": 0,
-             "hidden": 0, "flag-kept": 0}
+    stats = {
+        "restored": 0,
+        "dropped": 0,
+        "reviewer": 0,
+        "rule": 0,
+        "ignored": 0,
+        "hidden": 0,
+        "flag-kept": 0,
+    }
     for x in pack["turns"]:
         d = merged.get(x["id"], {})
         llm_keep = _first(d.get("keep"), x["llm"].get("keep"))
         held = llm_keep is False and _kept_by_flag(pack, x)
         stats["flag-kept"] += held
         keep = bool(_first(None if held else llm_keep, x["rule"]["keep"]))
-        if not keep and x["role"] == "user" and x["rule"]["keep"] and not x.get("meta"):
-            typed.append(x["id"])               # typed by the user: the rules keep these
+        if not keep and _typed_by_user(x):
+            typed.append(x["id"])  # typed by the user: the rules keep these
         llm_summary = _reviewer_summary(x, d, args, stats)
-        if x["id"] in merged:                    # reviewed, even if left to the rules
-            writes.append((x["id"], x.get("session") or pack.get("source"), x["llm_key"],
-                           llm_keep, llm_summary))
+        if x["id"] in merged:  # reviewed, even if left to the rules
+            writes.append(
+                (
+                    x["id"],
+                    x.get("session") or pack.get("source"),
+                    x["llm_key"],
+                    llm_keep,
+                    llm_summary,
+                )
+            )
         stats["restored"] += keep and not x["rule"]["keep"]
         stats["dropped"] += x["rule"]["keep"] and not keep
         if keep:
@@ -1921,31 +3257,42 @@ def _check_pack(pack, merged, args):
     ids = {x["id"] for x in pack["turns"]}
     unknown = [i for i in merged if i not in ids]
     if unknown:
-        print(f"[lineage] WARN: decisions name {len(unknown)} turn(s) not in the pack, "
-              f"ignored: {', '.join(unknown[:5])}", file=sys.stderr)
-    _warn_coverage(pack, set(merged) | {x["id"] for x in pack["turns"]
-                                        if x["llm"].get("cached")})
+        print(
+            f"[lineage] WARN: decisions name {len(unknown)} turn(s) not in the pack, "
+            f"ignored: {', '.join(_shown_id(i) for i in unknown[:5])}",
+            file=sys.stderr,
+        )
+    _warn_coverage(
+        pack, set(merged) | {x["id"] for x in pack["turns"] if x["llm"].get("cached")}
+    )
     if pack.get("redact_mode") in ("full", "mask"):
         args.redact_mode = pack["redact_mode"]
     if pack.get("redact_extra") is True and not args.redact_extra:
-        print("[lineage] WARN: --emit-review had --redact-extra; give the same keywords "
-              "here too, or reviewer summaries miss that redaction", file=sys.stderr)
+        print(
+            "[lineage] WARN: --emit-review had --redact-extra; give the same keywords "
+            "here too, or reviewer summaries miss that redaction",
+            file=sys.stderr,
+        )
     _gate_from_pack(args, pack)
 
 
 def _remove_review_files(pack_path, pack):
     """After a good render the pack, its parts and the decisions beside it go: they hold
     the redacted session."""
-    samples = f"{pack_path.stem}.reviewer-input.json"      # a failed gate's, beside the pack
+    samples = (
+        f"{pack_path.stem}.reviewer-input.json"  # a failed gate's, beside the pack
+    )
     names = [pack_path.name, samples]
     for p in pack.get("parts") or []:
         if isinstance(p, dict):
-            names += [p.get(k) for k in ("file", "decisions") if isinstance(p.get(k), str)]
+            names += [
+                p.get(k) for k in ("file", "decisions") if isinstance(p.get(k), str)
+            ]
     prefix = pack_path.stem + ".part-"
     left = []
     for name in names:
         if name not in (pack_path.name, samples) and not name.startswith(prefix):
-            continue                              # only what --emit-review named
+            continue  # only what --emit-review named
         try:
             pack_path.with_name(name).unlink()
         except FileNotFoundError:
@@ -1953,8 +3300,10 @@ def _remove_review_files(pack_path, pack):
         except (OSError, ValueError):
             left.append(name)
     if left:
-        print(f"[lineage] WARN: could not remove review files: {', '.join(left)}",
-              file=sys.stderr)
+        print(
+            f"[lineage] WARN: could not remove review files: {', '.join(left)}",
+            file=sys.stderr,
+        )
 
 
 def _samples_left_unread(pack_path, args):
@@ -1962,7 +3311,9 @@ def _samples_left_unread(pack_path, args):
     gives neither a verdict path nor --skip-reviewer: it would pass over that run's verdict."""
     left = pack_path.with_name(f"{pack_path.stem}.reviewer-input.json")
     if left.exists() and not (args.reviewer_output or args.skip_reviewer):
-        _bad(f"{left} was left by a gated run; give its --reviewer-output again, or --skip-reviewer")
+        _bad(
+            f"{left} was left by a gated run; give its --reviewer-output again, or --skip-reviewer"
+        )
         return True
     return False
 
@@ -1977,18 +3328,30 @@ def _review_output(args, pack):
 
 def _report_review(stats, turns, pack, typed):
     """What the render took from the reviewers, and the turns typed by the user they dropped."""
-    print(f"[lineage] review applied: shown={len(turns)}/{len(pack['turns'])} "
-          f"restored={stats['restored']} dropped={stats['dropped']} "
-          f"summaries reviewer={stats['reviewer']} rule={stats['rule']}", file=sys.stderr)
+    print(
+        f"[lineage] review applied: shown={len(turns)}/{len(pack['turns'])} "
+        f"restored={stats['restored']} dropped={stats['dropped']} "
+        f"summaries reviewer={stats['reviewer']} rule={stats['rule']}",
+        file=sys.stderr,
+    )
     if stats["ignored"]:
-        print(f"[lineage] note: {stats['ignored']} summaries for turns the page shows "
-              "in full were ignored", file=sys.stderr)
+        print(
+            f"[lineage] note: {stats['ignored']} summaries for turns the page shows "
+            "in full were ignored",
+            file=sys.stderr,
+        )
     if stats["flag-kept"]:
-        print(f"[lineage] note: {stats['flag-kept']} turn(s) a reviewer marked keep: false "
-              "stay, as --keep-trivia or --keep-tool-only asked", file=sys.stderr)
+        print(
+            f"[lineage] note: {stats['flag-kept']} turn(s) a reviewer marked keep: false "
+            "stay, as --keep-trivia or --keep-tool-only asked",
+            file=sys.stderr,
+        )
     if typed:
-        print(f"[lineage] WARN: reviewers dropped {len(typed)} typed user turn(s): {', '.join(typed[:10])}"
-              f"{' ...' if len(typed) > 10 else ''}; tell the user", file=sys.stderr)
+        print(
+            f"[lineage] WARN: reviewers dropped {len(typed)} typed user turn(s): {', '.join(_shown_id(i) for i in typed[:10])}"
+            f"{' ...' if len(typed) > 10 else ''}; tell the user",
+            file=sys.stderr,
+        )
 
 
 def apply_review(args):
@@ -2009,13 +3372,18 @@ def apply_review(args):
     if stats["hidden"]:
         prior["reviewer-summary"] = stats["hidden"]
     try:
-        rc = render_and_write(turns, pack.get("source") or "session", args,
-                              all_sessions=bool(pack.get("all_sessions")),
-                              markdown=pack.get("markdown") is not False,
-                              open_details=bool(pack.get("open")),
-                              title=str(pack.get("title") or "Session Lineage"),
-                              summaries=summaries, prior_redactions=prior)
-    except SystemExit as e:                       # the quality gate failed
+        rc = render_and_write(
+            turns,
+            pack.get("source") or "session",
+            args,
+            all_sessions=bool(pack.get("all_sessions")),
+            markdown=pack.get("markdown") is not False,
+            open_details=bool(pack.get("open")),
+            title=str(pack.get("title") or "Session Lineage"),
+            summaries=summaries,
+            prior_redactions=prior,
+        )
+    except SystemExit as e:  # the quality gate failed
         rc = int(e.code) if isinstance(e.code, int) else 2
     if rc == 0:
         for w in writes:
@@ -2028,66 +3396,133 @@ def apply_review(args):
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="lineage",
-        description="Export Claude Code session(s) as a KakaoTalk-style HTML file.")
+        description="Export Claude Code session(s) as a KakaoTalk-style HTML file.",
+    )
     ap.add_argument("--last", type=int, help="keep last N turns")
     ap.add_argument("--from", dest="from_", help="ISO timestamp from (inclusive)")
     ap.add_argument("--to", help="ISO timestamp to (inclusive)")
     ap.add_argument("--turns", help='range like "10-50" (1-indexed inclusive)')
-    ap.add_argument("--output", default=None,
-                    help="output HTML path (default: work/lineage-{name}_YYMMDD+HHMM.html)")
+    ap.add_argument(
+        "--output",
+        default=None,
+        help="output HTML path (default: work/lineage-{name}_YYMMDD+HHMM.html)",
+    )
     ap.add_argument("--session", help="jsonl path (overrides auto-discover)")
-    ap.add_argument("--all-sessions", action="store_true",
-                    help="merge ALL sessions in the project dir, chronologically")
-    ap.add_argument("--from-transcript",
-                    help="read transcript from PATH or '-' for stdin")
+    ap.add_argument(
+        "--all-sessions",
+        action="store_true",
+        help="merge ALL sessions in the project dir, chronologically",
+    )
+    ap.add_argument(
+        "--from-transcript", help="read transcript from PATH or '-' for stdin"
+    )
     ap.add_argument("--redact-extra", help="comma-separated keywords to also redact")
-    ap.add_argument("--redact-mode", choices=["full", "mask"], default="full",
-                    help="redaction mode (full=[REDACTED], mask=abcd****wxyz)")
-    ap.add_argument("--unsafe-schema", action="store_true",
-                    help="proceed even on unknown schema markers")
-    ap.add_argument("--rebuild-summaries", action="store_true",
-                    help="ignore summary cache and re-summarize")
-    ap.add_argument("--purge-cache", action="store_true",
-                    help="purge ~/.cache/lineage then exit")
-    ap.add_argument("--skip-reviewer", action="store_true",
-                    help="skip reviewer quality gate (warn-only)")
-    ap.add_argument("--reviewer-output",
-                    help="path to Critic response JSON; enforces the quality gate")
-    ap.add_argument("--reviewer-timeout", type=int, default=None,
-                    help="seconds to wait for reviewer-output (default 60 with --rulebase; "
-                         "the reviewed flow waits only when this is given)")
+    ap.add_argument(
+        "--redact-mode",
+        choices=["full", "mask"],
+        default="full",
+        help="redaction mode (full=[REDACTED], mask=abcd****wxyz)",
+    )
+    ap.add_argument(
+        "--unsafe-schema",
+        action="store_true",
+        help="proceed even on unknown schema markers",
+    )
+    ap.add_argument(
+        "--rebuild-summaries",
+        action="store_true",
+        help="ignore summary cache and re-summarize",
+    )
+    ap.add_argument(
+        "--purge-cache", action="store_true", help="purge ~/.cache/lineage then exit"
+    )
+    ap.add_argument(
+        "--skip-reviewer",
+        action="store_true",
+        help="skip reviewer quality gate (warn-only)",
+    )
+    ap.add_argument(
+        "--reviewer-output",
+        help="path to Critic response JSON; enforces the quality gate",
+    )
+    ap.add_argument(
+        "--reviewer-timeout",
+        type=int,
+        default=None,
+        help="seconds to wait for reviewer-output (default 60 with --rulebase; "
+        "the reviewed flow waits only when this is given)",
+    )
     ap.add_argument("--title", default="Session Lineage", help="HTML title")
     _add_review_args(ap)
     # Readability defaults are ON. Opt-out flags restore raw/older behavior.
-    ap.add_argument("--hide-tool-only", dest="hide_tool_only", action="store_true",
-                    help="(DEFAULT) drop assistant turns that are only tool calls")
-    ap.add_argument("--keep-tool-only", dest="hide_tool_only", action="store_false",
-                    help="keep tool-only assistant turns (override default)")
-    ap.add_argument("--no-markdown", dest="markdown", action="store_false",
-                    help="disable markdown rendering (default: render ON)")
-    ap.add_argument("--keep-trivia", dest="drop_trivia", action="store_false",
-                    help="keep manipulation commands / injected bodies / echo / "
-                         "harness errors (default: filter ON)")
-    ap.add_argument("--open", dest="open_details", action="store_true",
-                    help="render bubbles expanded (default: collapsed)")
-    ap.add_argument("--collapse", dest="open_details", action="store_false",
-                    help="(DEFAULT) render bubbles collapsed")
-    ap.set_defaults(hide_tool_only=True, open_details=False,
-                    markdown=True, drop_trivia=True)
+    ap.add_argument(
+        "--hide-tool-only",
+        dest="hide_tool_only",
+        action="store_true",
+        help="(DEFAULT) drop assistant turns that are only tool calls",
+    )
+    ap.add_argument(
+        "--keep-tool-only",
+        dest="hide_tool_only",
+        action="store_false",
+        help="keep tool-only assistant turns (override default)",
+    )
+    ap.add_argument(
+        "--no-markdown",
+        dest="markdown",
+        action="store_false",
+        help="disable markdown rendering (default: render ON)",
+    )
+    ap.add_argument(
+        "--keep-trivia",
+        dest="drop_trivia",
+        action="store_false",
+        help="keep manipulation commands / injected bodies / echo / "
+        "harness errors (default: filter ON)",
+    )
+    ap.add_argument(
+        "--open",
+        dest="open_details",
+        action="store_true",
+        help="render bubbles expanded (default: collapsed)",
+    )
+    ap.add_argument(
+        "--collapse",
+        dest="open_details",
+        action="store_false",
+        help="(DEFAULT) render bubbles collapsed",
+    )
+    ap.set_defaults(
+        hide_tool_only=True, open_details=False, markdown=True, drop_trivia=True
+    )
     return ap
 
 
 def _add_review_args(ap):
     """The flags of the reviewed flow (3.0.0): --emit-review, the session's reviewers,
     then --apply-review."""
-    ap.add_argument("--rulebase", action="store_true",
-                    help="one pass, rules only (the default when no review flag is given)")
-    ap.add_argument("--emit-review", metavar="PACK",
-                    help="write the turns for the session model to review (JSON) and stop")
-    ap.add_argument("--apply-review", metavar="PACK",
-                    help="render from a review pack and the reviewer's decisions")
-    ap.add_argument("--decisions", action="append", default=[], metavar="FILE",
-                    help="reviewer decisions [{id, keep, summary}] for --apply-review (repeatable)")
+    ap.add_argument(
+        "--rulebase",
+        action="store_true",
+        help="one pass, rules only (the default when no review flag is given)",
+    )
+    ap.add_argument(
+        "--emit-review",
+        metavar="PACK",
+        help="write the turns for the session model to review (JSON) and stop",
+    )
+    ap.add_argument(
+        "--apply-review",
+        metavar="PACK",
+        help="render from a review pack and the reviewer's decisions",
+    )
+    ap.add_argument(
+        "--decisions",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="reviewer decisions [{id, keep, summary}] for --apply-review (repeatable)",
+    )
 
 
 def _open_stream(path):
@@ -2098,12 +3533,18 @@ def _load_turns_from(path, unsafe_schema, session_id, session_name):
     """Parse one jsonl file, isolating per-file decode errors (D-3)."""
     try:
         with _open_stream(path) as stream:
-            return list(parse_turns(stream, unsafe_schema=unsafe_schema,
-                                    session_id=session_id,
-                                    session_name=session_name))
+            return list(
+                parse_turns(
+                    stream,
+                    unsafe_schema=unsafe_schema,
+                    session_id=session_id,
+                    session_name=session_name,
+                )
+            )
     except (OSError, UnicodeDecodeError) as e:
-        print(f"[lineage] WARN: skipping unreadable session {path}: {e}",
-              file=sys.stderr)
+        print(
+            f"[lineage] WARN: skipping unreadable session {path}: {e}", file=sys.stderr
+        )
         return []
 
 
@@ -2122,121 +3563,217 @@ def _flag_clash(args):
     return None
 
 
-def main(argv=None) -> int:
-    args = build_arg_parser().parse_args(argv)
-
+def _merge_env_extra(args):
+    """LINEAGE_REDACT_EXTRA's keywords after --redact-extra's."""
     env_extra = os.environ.get("LINEAGE_REDACT_EXTRA", "").strip()
     if env_extra:
-        args.redact_extra = ",".join(
-            p for p in (args.redact_extra, env_extra) if p)
+        args.redact_extra = ",".join(p for p in (args.redact_extra, env_extra) if p)
 
+
+def _purge_cache():
+    import shutil
+
+    if CACHE_BASE.exists():
+        shutil.rmtree(CACHE_BASE)
+        print(f"[lineage] cache purged: {CACHE_BASE}", file=sys.stderr)
+    else:
+        print("[lineage] no cache to purge", file=sys.stderr)
+    return 0
+
+
+def _run_apply(args):
+    if any(
+        (
+            args.last,
+            args.from_,
+            args.to,
+            args.turns,
+            args.session,
+            args.all_sessions,
+            args.from_transcript,
+        )
+    ):
+        print(
+            "[lineage] note: --apply-review renders the pack; source and range "
+            "flags were applied at --emit-review",
+            file=sys.stderr,
+        )
+    return apply_review(args)
+
+
+def _read_all_sessions(args):
+    """Every session of the project folder, merged record by record in time order."""
+    files = project_jsonl_files()
+    if not files:
+        print(
+            "[lineage] --all-sessions: no jsonl found in project dir", file=sys.stderr
+        )
+        return 2, [], "session", None
+    starts = {p: session_start(p) for p in files}
+    turns = []
+    for p in files:
+        name = (
+            discover_session_name(p)
+            or (p.stem[-36:] if p.stem.startswith("rollout-") else p.stem)[:8]
+        )
+        part = _load_turns_from(p, args.unsafe_schema, p.stem, name)
+        meta = _codex_meta(p)
+        if meta is not None and not any(t["role"] == "user" for t in part):
+            print(
+                f"[lineage] WARN: {p.name}: no user turn read from this Codex {meta.get('cli_version', '?')} "
+                "record (a new record shape?); left out",
+                file=sys.stderr,
+            )
+            continue
+        fill_missing_ts(part)
+        for t in part:
+            t["session_ts"] = starts[p] or "9999"
+        turns.extend(part)
+    # record-level chronological sort (stable → same-ts keeps file order)
+    turns.sort(key=lambda t: t.get("ts") or t.get("session_ts") or "9999")
+    print(f"[lineage] --all-sessions: merged {len(files)} sessions", file=sys.stderr)
+    return None, turns, "all-sessions", None
+
+
+def _read_transcript(args):
+    """A transcript pasted on stdin ('-') or read from a file."""
+    if args.from_transcript == "-":
+        turns = list(
+            parse_turns(sys.stdin, unsafe_schema=args.unsafe_schema, session_id="stdin")
+        )
+        return None, turns, "stdin", None
+    jsonl_path = pathlib.Path(args.from_transcript)
+    session_id = "file-" + jsonl_path.stem
+    turns = _load_turns_from(jsonl_path, args.unsafe_schema, session_id, None)
+    return None, turns, session_id, jsonl_path
+
+
+def _read_discovered(args):
+    """The newest session of the project folder."""
+    f = auto_discover_jsonl()
+    if not f:
+        print(
+            "[lineage] No jsonl found. Use one of:",
+            "\n  --session FILE         explicit jsonl path",
+            "\n  --all-sessions         merge all project sessions",
+            "\n  --from-transcript -    paste transcript via stdin",
+            "\n  --from-transcript FILE read transcript from file",
+            "\n(non-ASCII cwd may not auto-encode — use --session)",
+            file=sys.stderr,
+        )
+        return 2, [], "session", None
+    turns = _load_turns_from(f, args.unsafe_schema, f.stem, None)
+    print(f"[lineage] auto-discovered session: {f.name}", file=sys.stderr)
+    return None, turns, f.stem, f
+
+
+def _read_input(args):
+    """(exit code or None, raw turns, session id, jsonl path) from the source the flags name: a Claude Code
+    transcript or a Codex session record (rollout), told apart by its first record. The code is 2 when there is no
+    source, or the code a schema marker stopped the read with. A Codex rollout that gives no user turn stops with 2
+    too: every Codex session starts with what the user typed, so none means this Codex version writes its record in a
+    shape lineage does not read, and an empty page would hide that."""
+    rc, turns, session_id, jsonl_path = _read_source(args)
+    meta = _codex_meta(jsonl_path) if rc is None and jsonl_path is not None else None
+    if meta is not None and not any(t["role"] == "user" for t in turns):
+        print(
+            f"[lineage] ERROR: {jsonl_path.name} is a Codex {meta.get('cli_version', '?')} session record, but no "
+            "user turn was read from it; this Codex version may write its record in a new shape "
+            "(nothing written; update banker or report it)",
+            file=sys.stderr,
+        )
+        return 2, [], session_id, None
+    return rc, turns, session_id, jsonl_path
+
+
+def _read_source(args):
+    """(exit code or None, raw turns, session id, jsonl path) as read, before the Codex shape check."""
+    try:
+        if args.all_sessions:
+            return _read_all_sessions(args)
+        if args.from_transcript:
+            return _read_transcript(args)
+        if args.session:
+            jsonl_path = pathlib.Path(args.session)
+            turns = _load_turns_from(
+                jsonl_path, args.unsafe_schema, jsonl_path.stem, None
+            )
+            return None, turns, jsonl_path.stem, jsonl_path
+        return _read_discovered(args)
+    except SystemExit as e:
+        return (int(e.code) if isinstance(e.code, int) else 2), [], "session", None
+
+
+def _stdin_ids(turns):
+    """stdin → derive per-turn uuid from the content so the caches work (keyed: see _stdin_id_key)."""
+    key = _stdin_id_key()
+    for t in turns:
+        t["uuid"] = hmac.new(key, str(t["text"]).encode(), hashlib.sha256).hexdigest()[
+            :16
+        ]
+
+
+def _run_emit(turns, session_id, jsonl_path, args):
+    drops = heuristic_drops(turns, args)
+    window = review_window(turns, drops, args)
+    if window is None:
+        return 2
+    return emit_review(
+        turns,
+        drops,
+        window,
+        session_id,
+        default_output(args, jsonl_path, session_id),
+        args,
+    )
+
+
+def _rulebase_turns(turns, args):
+    """The turns a --rulebase page shows: echo exchanges and tool-only turns gone (unless kept), then the range.
+    None on an invalid --turns."""
+    if args.drop_trivia:
+        turns = drop_echo_exchanges(turns)
+    if args.hide_tool_only:
+        turns = [
+            t for t in turns if not (t["role"] == "assistant" and not t["text"].strip())
+        ]
+    return select_range(turns, args)
+
+
+def main(argv=None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    _merge_env_extra(args)
     clash = _flag_clash(args)
     if clash:
         print(f"[lineage] ERROR: {clash}", file=sys.stderr)
         return 2
-
     if args.purge_cache:
-        import shutil
-        if CACHE_BASE.exists():
-            shutil.rmtree(CACHE_BASE)
-            print(f"[lineage] cache purged: {CACHE_BASE}", file=sys.stderr)
-        else:
-            print("[lineage] no cache to purge", file=sys.stderr)
-        return 0
-
+        return _purge_cache()
     if args.apply_review:
-        if any((args.last, args.from_, args.to, args.turns, args.session,
-                args.all_sessions, args.from_transcript)):
-            print("[lineage] note: --apply-review renders the pack; source and range "
-                  "flags were applied at --emit-review", file=sys.stderr)
-        return apply_review(args)
-
-    # ---- Resolve input → raw turns (parse + parts + session) ----
-    turns = []
-    session_id = "session"
-    jsonl_path = None
-    try:
-        if args.all_sessions:
-            files = project_jsonl_files()
-            if not files:
-                print("[lineage] --all-sessions: no jsonl found in project dir",
-                      file=sys.stderr)
-                return 2
-            starts = {p: session_start(p) for p in files}
-            for p in files:
-                name = discover_session_name(p) or p.stem[:8]
-                part = _load_turns_from(p, args.unsafe_schema, p.stem, name)
-                fill_missing_ts(part)
-                for t in part:
-                    t["session_ts"] = starts[p] or "9999"
-                turns.extend(part)
-            # record-level chronological sort (stable → same-ts keeps file order)
-            turns.sort(key=lambda t: t.get("ts") or t.get("session_ts") or "9999")
-            session_id = "all-sessions"
-            print(f"[lineage] --all-sessions: merged {len(files)} sessions",
-                  file=sys.stderr)
-        elif args.from_transcript:
-            if args.from_transcript == "-":
-                turns = list(parse_turns(sys.stdin, unsafe_schema=args.unsafe_schema,
-                                         session_id="stdin"))
-                session_id = "stdin"
-            else:
-                jsonl_path = pathlib.Path(args.from_transcript)
-                session_id = "file-" + jsonl_path.stem
-                turns = _load_turns_from(jsonl_path, args.unsafe_schema,
-                                         session_id, None)
-        elif args.session:
-            jsonl_path = pathlib.Path(args.session)
-            session_id = jsonl_path.stem
-            turns = _load_turns_from(jsonl_path, args.unsafe_schema,
-                                     session_id, None)
-        else:
-            f = auto_discover_jsonl()
-            if not f:
-                print("[lineage] No jsonl found. Use one of:",
-                      "\n  --session FILE         explicit jsonl path",
-                      "\n  --all-sessions         merge all project sessions",
-                      "\n  --from-transcript -    paste transcript via stdin",
-                      "\n  --from-transcript FILE read transcript from file",
-                      "\n(non-ASCII cwd may not auto-encode — use --session)",
-                      file=sys.stderr)
-                return 2
-            jsonl_path = f
-            session_id = f.stem
-            turns = _load_turns_from(f, args.unsafe_schema, session_id, None)
-            print(f"[lineage] auto-discovered session: {f.name}", file=sys.stderr)
-    except SystemExit as e:
-        return int(e.code) if isinstance(e.code, int) else 2
-
-    # stdin → derive per-turn uuid from the content so the caches work (keyed: see _stdin_id_key)
+        return _run_apply(args)
+    rc, turns, session_id, jsonl_path = _read_input(args)
+    if rc is not None:
+        return rc
     if args.from_transcript == "-":
-        key = _stdin_id_key()
-        for t in turns:
-            t["uuid"] = hmac.new(key, str(t["text"]).encode(), hashlib.sha256).hexdigest()[:16]
-
+        _stdin_ids(turns)
     # ---- Pipeline order (R6): classify → merge → echo → hide-tool-only → range ----
-    turns = classify_turns(turns, drop_trivia=args.drop_trivia)
-    turns = merge_assistant_runs(turns)
+    turns = merge_assistant_runs(classify_turns(turns, drop_trivia=args.drop_trivia))
     if args.emit_review:
-        drops = heuristic_drops(turns, args)
-        window = review_window(turns, drops, args)
-        if window is None:
-            return 2
-        return emit_review(turns, drops, window, session_id,
-                           default_output(args, jsonl_path, session_id), args)
-    if args.drop_trivia:
-        turns = drop_echo_exchanges(turns)
-    if args.hide_tool_only:
-        turns = [t for t in turns
-                 if not (t["role"] == "assistant" and not t["text"].strip())]
-    turns = select_range(turns, args)
+        return _run_emit(turns, session_id, jsonl_path, args)
+    turns = _rulebase_turns(turns, args)
     if turns is None:
         return 2
     if args.output is None:
         args.output = default_output(args, jsonl_path, session_id)
-    return render_and_write(turns, session_id, args, all_sessions=args.all_sessions,
-                            markdown=args.markdown, open_details=args.open_details,
-                            title=args.title)
+    return render_and_write(
+        turns,
+        session_id,
+        args,
+        all_sessions=args.all_sessions,
+        markdown=args.markdown,
+        open_details=args.open_details,
+        title=args.title,
+    )
 
 
 def _in_time(t, args):
@@ -2273,8 +3810,10 @@ def select_range(turns, args):
         return None
     turns = turns[sl]
     if len(turns) > 100:
-        print(f"[lineage] WARN: {len(turns)} turns is large — render may be slow",
-              file=sys.stderr)
+        print(
+            f"[lineage] WARN: {len(turns)} turns is large — render may be slow",
+            file=sys.stderr,
+        )
     return turns
 
 
@@ -2285,34 +3824,65 @@ def default_output(args, jsonl_path, session_id):
         return args.output
     session_name = discover_session_name(jsonl_path) if jsonl_path else None
     if session_name and page_redact(session_name)[0] != session_name:
-        print(f"[lineage] session name: {page_redact(session_name)[0]} "
-              "(holds a secret-like string; the file is named by the session id)", file=sys.stderr)
+        print(
+            f"[lineage] session name: {page_redact(session_name)[0]} "
+            "(holds a secret-like string; the file is named by the session id)",
+            file=sys.stderr,
+        )
         session_name = None
-    slug = ("all-sessions" if args.all_sessions
-            else (session_name or session_id[:8]))
+    slug = "all-sessions" if args.all_sessions else (session_name or session_id[:8])
     if session_name:
         print(f"[lineage] session name: {session_name}", file=sys.stderr)
     return f"work/lineage-{slug}.html"
 
 
-def render_and_write(turns, session_id, args, all_sessions=False, markdown=True,
-                     open_details=False, title="Session Lineage", summaries=None,
-                     prior_redactions=None):
+# The controls that embed, override or isolate text direction (U+202A..U+202E, U+2066..U+2069). In a page they
+# reorder what a reader sees and can reach past the element that holds them, so the page shows each as a visible
+# [U+XXXX] instead. Plain letters of right-to-left scripts, and the direction marks, stay.
+_BIDI_CONTROLS = re.compile(
+    "[" + "".join(map(chr, (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))) + "]"
+)
+
+
+def _show_bidi_controls(text):
+    return _BIDI_CONTROLS.sub(lambda m: "[U+%04X]" % ord(m.group()), text)
+
+
+def render_and_write(
+    turns,
+    session_id,
+    args,
+    all_sessions=False,
+    markdown=True,
+    open_details=False,
+    title="Session Lineage",
+    summaries=None,
+    prior_redactions=None,
+):
     """Render the rows, fill the template, self-verify, write, run the reviewer gate.
     `prior_redactions`: what --emit-review redacted before the text reached the pack."""
     rows, redact_counts, hits, total = render_rows(
-        turns, session_id, args.redact_extra, args.redact_mode,
-        args.rebuild_summaries, open_details=open_details,
-        markdown=markdown, all_sessions=all_sessions, summaries=summaries)
+        turns,
+        session_id,
+        args.redact_extra,
+        args.redact_mode,
+        args.rebuild_summaries,
+        open_details=open_details,
+        markdown=markdown,
+        all_sessions=all_sessions,
+        summaries=summaries,
+    )
     for k, v in (prior_redactions or {}).items():
         redact_counts[k] = redact_counts.get(k, 0) + v
     left = _residual_secrets("\n".join(rows))
     if left:
-        print("[lineage] WARN: the page still holds secret-like text ("
-              + ", ".join(f"{k}={v}" for k, v in sorted(left.items()))
-              + "); check the page before sharing it, or run again with the value in LINEAGE_REDACT_EXTRA"
-              " (with --rulebase, add --rebuild-summaries)",
-              file=sys.stderr)
+        print(
+            "[lineage] WARN: the page still holds secret-like text ("
+            + ", ".join(f"{k}={v}" for k, v in sorted(left.items()))
+            + "); check the page before sharing it, or run again with the value in LINEAGE_REDACT_EXTRA"
+            " (with --rulebase, add --rebuild-summaries)",
+            file=sys.stderr,
+        )
 
     date_range = ""
     dated = [t for t in turns if t.get("ts")]
@@ -2322,10 +3892,14 @@ def render_and_write(turns, session_id, args, all_sessions=False, markdown=True,
         date_range = first if first == last else f"{first} ~ {last}"
 
     html_doc = HTML_TEMPLATE
-    html_doc = html_doc.replace("{{TITLE}}", html.escape(title), 1)
-    html_doc = html_doc.replace("{{HEADER_TITLE}}", html.escape(title), 1)
-    html_doc = html_doc.replace("{{DATE_RANGE}}", html.escape(date_range), 1)
-    html_doc = html_doc.replace("{{TURNS}}", "\n".join(rows), 1)
+    html_doc = html_doc.replace("{{TITLE}}", html.escape(_show_bidi_controls(title)), 1)
+    html_doc = html_doc.replace(
+        "{{HEADER_TITLE}}", html.escape(_show_bidi_controls(title)), 1
+    )
+    html_doc = html_doc.replace(
+        "{{DATE_RANGE}}", html.escape(_show_bidi_controls(date_range)), 1
+    )
+    html_doc = html_doc.replace("{{TURNS}}", _show_bidi_controls("\n".join(rows)), 1)
 
     errs = self_verify(html_doc)
     if errs:
@@ -2333,14 +3907,17 @@ def render_and_write(turns, session_id, args, all_sessions=False, markdown=True,
 
     out = _with_timestamp_suffix(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html_doc, encoding="utf-8")
+    _write_text_lf(out, html_doc)
 
     _run_reviewer_gate(turns, out, session_id, args, summaries=summaries)
 
     tool_total = sum(sum(t.get("tools", {}).values()) for t in turns)
-    print(f"[lineage] turns={len(turns)} redacted={sum(redact_counts.values())} "
-          f"tool_calls={tool_total} cache_hits={hits}/{total} "
-          f"size={out.stat().st_size}B output={out}", file=sys.stderr)
+    print(
+        f"[lineage] turns={len(turns)} redacted={sum(redact_counts.values())} "
+        f"tool_calls={tool_total} cache_hits={hits}/{total} "
+        f"size={out.stat().st_size}B output={out}",
+        file=sys.stderr,
+    )
     if redact_counts:
         details = ", ".join(f"{k}={v}" for k, v in sorted(redact_counts.items()))
         print(f"[lineage] redaction breakdown: {details}", file=sys.stderr)
@@ -2360,6 +3937,7 @@ def _with_pack_stamp(output, pack_output):
 def _with_timestamp_suffix(path_str):
     """Append `_YYMMDD+HHMM` before the extension (idempotent)."""
     import datetime as _dt
+
     p = pathlib.Path(path_str)
     if re.search(r"_\d{6}\+\d{4}$", p.stem):
         return p
@@ -2374,11 +3952,13 @@ def _gate_samples(bots, summaries, session_id, args):
     seeded by the turns, so a rerun on the same turns samples the same ones, and a sample
     names its turn and shows the head and tail the reviewer saw, fully redacted."""
     import random
+
     if summaries is None:
         out = []
         for i, t in enumerate(random.sample(bots, min(5, len(bots)))):
-            s, _ = _page_summary(t, summaries, session_id, False,
-                                 args.redact_extra, args.redact_mode)
+            s, _ = _page_summary(
+                t, summaries, session_id, False, args.redact_extra, args.redact_mode
+            )
             red_s = review_redact(_MASKED.sub("[REDACTED]", s), args.redact_extra)[0]
             red_d = review_redact(t["text"], args.redact_extra)[0][:500]
             out.append({"idx": i, "original_detail": red_d, "generated_summary": red_s})
@@ -2386,13 +3966,29 @@ def _gate_samples(bots, summaries, session_id, args):
     seed = hashlib.sha256("\x00".join(t["uuid"] for t in bots).encode()).hexdigest()
     out = []
     for i, t in enumerate(random.Random(seed).sample(bots, min(5, len(bots)))):
-        s = t.get("sample_summary") or _page_summary(t, summaries, session_id, False,
-                                                     args.redact_extra, args.redact_mode)[0]
-        detail = t.get("preview") or _preview(review_redact(t["text"], args.redact_extra)[0])[0]
+        s = (
+            t.get("sample_summary")
+            or _page_summary(
+                t, summaries, session_id, False, args.redact_extra, args.redact_mode
+            )[0]
+        )
+        detail = (
+            t.get("preview")
+            or _preview(review_redact(t["text"], args.redact_extra)[0])[0]
+        )
         gen = review_redact(_MASKED.sub("[REDACTED]", s), args.redact_extra)[0]
-        key = hashlib.sha256("\x00".join([t["uuid"], detail, gen]).encode()).hexdigest()[:12]
-        out.append({"idx": i, "id": t["uuid"], "key": key, "original_detail": detail,
-                    "generated_summary": gen})
+        key = hashlib.sha256(
+            "\x00".join([t["uuid"], detail, gen]).encode()
+        ).hexdigest()[:12]
+        out.append(
+            {
+                "idx": i,
+                "id": t["uuid"],
+                "key": key,
+                "original_detail": detail,
+                "generated_summary": gen,
+            }
+        )
     return out
 
 
@@ -2415,8 +4011,10 @@ def _renew_samples(path, text, rop):
     _write_private(path, text)
     old = pathlib.Path(rop) if rop else None
     if old is not None and _is_verdict_file(old):
-        print(f"[lineage] WARN: {rop} predates these samples; it is not read",
-              file=sys.stderr)
+        print(
+            f"[lineage] WARN: {rop} predates these samples; it is not read",
+            file=sys.stderr,
+        )
         _set_aside(old)
 
 
@@ -2427,21 +4025,30 @@ def _refuse_non_verdict(rop):
     p = pathlib.Path(rop) if rop else None
     if p is None or not p.exists() or _is_verdict_file(p):
         return
-    if _json_list(p):   # step 8: written again, the same answer fails the same way
-        why = ("it is a JSON array where no entry names idx; if the session wrote the critic's "
-               "answer, have the critic judge the samples again (a failed gate run)")
+    if _json_list(p):  # step 8: written again, the same answer fails the same way
+        why = (
+            "it is a JSON array where no entry names idx; if the session wrote the critic's "
+            "answer, have the critic judge the samples again (a failed gate run)"
+        )
     else:
-        why = ("if the session wrote it, write it again as a bare JSON array of "
-               "{idx, id, key, recoverable, reason}")
-    print(f"[lineage] ERROR: {rop} is not a verdict list; {why}, else give a --reviewer-output "
-          "that does not exist yet", file=sys.stderr)
+        why = (
+            "if the session wrote it, write it again as a bare JSON array of "
+            "{idx, id, key, recoverable, reason}"
+        )
+    print(
+        f"[lineage] ERROR: {rop} is not a verdict list; {why}, else give a --reviewer-output "
+        "that does not exist yet",
+        file=sys.stderr,
+    )
     raise SystemExit(2)
 
 
 def _json_list(p):
     """True when `p` is a file holding a JSON array, whatever its entries."""
     try:
-        return p.is_file() and isinstance(json.loads(p.read_text(encoding="utf-8")), list)
+        return p.is_file() and isinstance(
+            json.loads(p.read_text(encoding="utf-8")), list
+        )
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         return False
 
@@ -2474,8 +4081,9 @@ def _write_gate_samples(bots, out, summaries, session_id, args):
     if summaries is not None and getattr(args, "apply_review", None):
         pack = pathlib.Path(args.apply_review)
         path = pack.with_name(f"{pack.stem}.reviewer-input.json")
-    text = json.dumps(_gate_samples(bots, summaries, session_id, args),
-                      ensure_ascii=False, indent=2)
+    text = json.dumps(
+        _gate_samples(bots, summaries, session_id, args), ensure_ascii=False, indent=2
+    )
     try:
         if summaries is None:
             _write_private(path, text)
@@ -2483,20 +4091,35 @@ def _write_gate_samples(bots, out, summaries, session_id, args):
             _renew_samples(path, text, args.reviewer_output)
     except OSError as e:
         if summaries is not None:
-            print(f"[lineage] ERROR: cannot write the gate samples {path}: {e}", file=sys.stderr)
+            print(
+                f"[lineage] ERROR: cannot write the gate samples {path}: {e}",
+                file=sys.stderr,
+            )
             raise SystemExit(2)
         return None
     print(f"[lineage] reviewer samples: {path}", file=sys.stderr, flush=True)
     if summaries is None:
-        print("[lineage] next: invoke Skill('oh-my-claudecode:critic') with "
-              "the JSON above; expected [{idx, recoverable, reason}, ...] "
-              "(PASS = 5/5 recoverable)", file=sys.stderr, flush=True)
+        print(
+            "[lineage] next: invoke Skill('oh-my-claudecode:critic') with "
+            "the JSON above; expected [{idx, recoverable, reason}, ...] "
+            "(PASS = 5/5 recoverable)",
+            file=sys.stderr,
+            flush=True,
+        )
     elif pathlib.Path(args.reviewer_output).exists():
-        print(f"[lineage] reading the verdict at {args.reviewer_output}", file=sys.stderr, flush=True)
+        print(
+            f"[lineage] reading the verdict at {args.reviewer_output}",
+            file=sys.stderr,
+            flush=True,
+        )
     else:
-        print(f"[lineage] next: have a critic agent judge the JSON above and write its "
-              f"[{{idx, id, key, recoverable, reason}}, ...] to {args.reviewer_output} "
-              "(one per sample; PASS = all recoverable)", file=sys.stderr, flush=True)
+        print(
+            f"[lineage] next: have a critic agent judge the JSON above and write its "
+            f"[{{idx, id, key, recoverable, reason}}, ...] to {args.reviewer_output} "
+            "(one per sample; PASS = all recoverable)",
+            file=sys.stderr,
+            flush=True,
+        )
     return path
 
 
@@ -2506,26 +4129,32 @@ def _read_verdict(rop, timeout, set_aside):
     so a rerun waits for a fresh one instead of reusing it; anything else stays where it is.
     Exits 2 when it is missing, unreadable or not a non-empty list."""
     import time as _time
+
     deadline = _time.time() + (0 if timeout is None else max(1, timeout))
     while not rop.exists() and _time.time() < deadline:
         _time.sleep(1)
     if not rop.exists():
         if timeout is None:
-            print(f"[lineage] ERROR: no verdict at {rop} yet; have a critic judge the samples, "
-                  "write its answer there and run this again", file=sys.stderr)
+            print(
+                f"[lineage] ERROR: no verdict at {rop} yet; have a critic judge the samples, "
+                "write its answer there and run this again",
+                file=sys.stderr,
+            )
         else:
-            print(f"[lineage] ERROR: reviewer-output not found within "
-                  f"{timeout}s: {rop}", file=sys.stderr)
+            print(
+                f"[lineage] ERROR: reviewer-output not found within {timeout}s: {rop}",
+                file=sys.stderr,
+            )
         raise SystemExit(2)
     try:
         verdict = json.loads(rop.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, RecursionError) as e:
-        print(f"[lineage] ERROR: reviewer-output parse failed: {e}",
-              file=sys.stderr)
+        print(f"[lineage] ERROR: reviewer-output parse failed: {e}", file=sys.stderr)
         raise SystemExit(2)
     if not isinstance(verdict, list) or not verdict:
-        print("[lineage] ERROR: reviewer-output is not a non-empty array",
-              file=sys.stderr)
+        print(
+            "[lineage] ERROR: reviewer-output is not a non-empty array", file=sys.stderr
+        )
         raise SystemExit(2)
     if set_aside:
         _set_aside(rop)
@@ -2548,8 +4177,11 @@ def _set_aside(rop):
     try:
         os.replace(str(rop), str(dest))
     except OSError as e:
-        print(f"[lineage] WARN: could not set the verdict aside ({e}); remove {rop} "
-              "before the next run", file=sys.stderr)
+        print(
+            f"[lineage] WARN: could not set the verdict aside ({e}); remove {rop} "
+            "before the next run",
+            file=sys.stderr,
+        )
         return
     print(f"[lineage] note: verdict moved to {dest}", file=sys.stderr)
 
@@ -2558,12 +4190,20 @@ def _verdict_gaps(verdict, samples):
     """Why a verdict does not answer these samples, or "": it needs one entry per sample
     idx and no other, each carrying the `id` and `key` of that sample (its turn and its
     content: an answer to the samples from before a fix carries an old key)."""
-    want = {s["idx"]: s for s in samples if isinstance(s, dict) and type(s.get("idx")) is int}
+    want = {
+        s["idx"]: s
+        for s in samples
+        if isinstance(s, dict) and type(s.get("idx")) is int
+    }
     seen, stray = set(), []
     for v in verdict:
         idx = v.get("idx") if isinstance(v, dict) else None
-        if (type(idx) is not int or idx not in want or idx in seen
-                or any(v.get(k) != want[idx][k] for k in ("id", "key") if k in want[idx])):
+        if (
+            type(idx) is not int
+            or idx not in want
+            or idx in seen
+            or any(v.get(k) != want[idx][k] for k in ("id", "key") if k in want[idx])
+        ):
             stray.append(idx)
         else:
             seen.add(idx)
@@ -2577,15 +4217,27 @@ def _check_coverage(verdict, samples):
     """Exit 2 unless the verdict answers each of the samples in file `samples`."""
     try:
         gaps = _verdict_gaps(verdict, json.loads(samples.read_text(encoding="utf-8")))
-    except (OSError, ValueError, UnicodeDecodeError, AttributeError) as e:
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        AttributeError,
+        RecursionError,
+    ) as e:
         gaps = f"cannot read the samples: {e}"
     if gaps:
-        print(f"[lineage] ERROR: the verdict does not answer {samples} ({gaps}); have the "
-              "critic judge every sample again", file=sys.stderr)
+        print(
+            f"[lineage] ERROR: the verdict does not answer {samples} ({gaps}); have the "
+            "critic judge every sample again",
+            file=sys.stderr,
+        )
         for v in verdict:
             if isinstance(v, dict) and v.get("recoverable") is not True:
-                print(f"  - not recoverable in it: idx={v.get('idx', '?')}: "
-                      f"{v.get('reason', '(no reason)')}", file=sys.stderr)
+                print(
+                    f"  - not recoverable in it: idx={v.get('idx', '?')}: "
+                    f"{v.get('reason', '(no reason)')}",
+                    file=sys.stderr,
+                )
         raise SystemExit(2)
 
 
@@ -2596,18 +4248,26 @@ def _enforce_gate(rop, timeout, samples=None, reviewed=False):
     verdict = _read_verdict(rop, timeout, set_aside=reviewed)
     if reviewed and samples is not None:
         _check_coverage(verdict, samples)
-    fails = [v for v in verdict
-             if not (isinstance(v, dict) and v.get("recoverable") is True)]
+    fails = [
+        v for v in verdict if not (isinstance(v, dict) and v.get("recoverable") is True)
+    ]
     if fails:
-        print(f"[lineage] FAIL: quality gate {len(verdict) - len(fails)}/"
-              f"{len(verdict)} recoverable. Reasons:", file=sys.stderr)
+        print(
+            f"[lineage] FAIL: quality gate {len(verdict) - len(fails)}/"
+            f"{len(verdict)} recoverable. Reasons:",
+            file=sys.stderr,
+        )
         for f in fails:
             if isinstance(f, dict):
-                print(f"  - idx={f.get('idx', '?')}: "
-                      f"{f.get('reason', '(no reason)')}", file=sys.stderr)
+                print(
+                    f"  - idx={f.get('idx', '?')}: {f.get('reason', '(no reason)')}",
+                    file=sys.stderr,
+                )
         raise SystemExit(2)
-    print(f"[lineage] PASS: quality gate {len(verdict)}/{len(verdict)} "
-          "recoverable", file=sys.stderr)
+    print(
+        f"[lineage] PASS: quality gate {len(verdict)}/{len(verdict)} recoverable",
+        file=sys.stderr,
+    )
     if reviewed and samples is not None:
         try:
             samples.unlink()
@@ -2623,17 +4283,23 @@ def _run_reviewer_gate(turns, out, session_id, args, summaries=None):
     bots = [t for t in turns if t["role"] in ("assistant", "agent")]
     reviewed = summaries is not None
     if args.skip_reviewer:
-        print("[lineage] WARN: --skip-reviewer — quality gate not enforced",
-              file=sys.stderr)
+        print(
+            "[lineage] WARN: --skip-reviewer — quality gate not enforced",
+            file=sys.stderr,
+        )
         return
     if not bots or (reviewed and not args.reviewer_output):
         return
     samples = _write_gate_samples(bots, out, summaries, session_id, args)
     if args.reviewer_output:
         if reviewed and args.reviewer_timeout is None:
-            timeout = None      # the run after the critic reads the verdict; this one does not wait
+            timeout = None  # the run after the critic reads the verdict; this one does not wait
         else:
-            timeout = REVIEWER_TIMEOUT if args.reviewer_timeout is None else args.reviewer_timeout
+            timeout = (
+                REVIEWER_TIMEOUT
+                if args.reviewer_timeout is None
+                else args.reviewer_timeout
+            )
         _enforce_gate(pathlib.Path(args.reviewer_output), timeout, samples, reviewed)
 
 

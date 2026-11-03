@@ -7,7 +7,6 @@
 name: verifier
 description: Verification strategy, evidence-based completion checks, test adequacy
 model: sonnet          # -> Muse 환경: subagent 기본 모델 사용
-level: 3               # -> Muse 환경: 미적용
 disallowedTools: Write, Edit   # -> Muse 환경: 대응 — 검증자는 파일 쓰기/수정을 하지 않는다 (읽기+실행만)
 -->
 

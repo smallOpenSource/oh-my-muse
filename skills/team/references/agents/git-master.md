@@ -4,7 +4,6 @@
 > 참고: 원본 정의 (oh-my-claudecode 플러그인, Claude Code 전용)
 > - description: Git expert for atomic commits, rebasing, and history management with style detection
 > - model: sonnet
-> - level: 3
 > <!-- Muse 환경에 없는 에이전트 frontmatter(모델 지정, Task 도구 연동, hooks 등)는 적용하지 않는다. 이 파일은 역할 프롬프트로만 사용한다. -->
 
 <Agent_Prompt>

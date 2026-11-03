@@ -1,6 +1,6 @@
 ---
 name: play-qa
-description: "Godot HTML5 웹게임을 실제 브라우저에서 직접 플레이하며 렌더·입력·시작 결함을 QA(playwright). 사용자가 '게임 직접 플레이해서 QA해줘', '네가 직접 플레이해봐', 'play-qa'라고 요청하면 사용."
+description: "웹 기반 동작 콘텐츠(예: HTML5 웹게임)를 실제 브라우저에서 직접 플레이하며 렌더·입력·시작 결함을 QA(playwright). 사용자가 '게임 직접 플레이해서 QA해줘', '네가 직접 플레이해봐', 'play-qa'라고 요청하면 사용."
 ---
 
 # play-qa: 에이전트가 직접 브라우저에서 게임을 플레이·QA
@@ -11,6 +11,11 @@ description: "Godot HTML5 웹게임을 실제 브라우저에서 직접 플레�
 *렌더·HUD·입력 반영·시작·소프트락* — 을 **에이전트가 실제 브라우저에서 게임을 직접 플레이**하며
 객관적으로 잡는다. (실증: 이 스킬이 '탭/클릭으로 8게임 중 7개가 시작조차 안 되는' 터치기기 쇼스토퍼를
 잡았다. 헤드리스는 못 봤다.)
+
+## 0. 전제조건: playwright (없으면 설치부터)
+이 스킬은 playwright 브라우저가 있어야 동작한다. **진행 전 설치 여부를 먼저 확인**하고, 없으면 **설치부터 안내**한다(추정·임의 재설치 금지):
+- 확인: `ls "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}" 2>/dev/null | grep -qi chromium && echo ok`
+- 미설치면 아래 Workflow §0의 직접 설치 절차로 설치한다(원본의 `setup-playwright` 스킬 위임 경로는 이 워크스페이스에 해당 스킬이 없으므로 대체한다). 설치·검증 후 이 스킬을 이어서 진행한다.
 
 ## 언제
 
@@ -101,6 +106,20 @@ gridfit=트레이→격자 DRAG(픽업=합성한계) · ward=가로 DRAG 잉크�
 - 캔버스는 DOM이 아니라 canvas 렌더 → 점수/HUD는 DOM 스크랩 불가, **스크린샷 판독**으로만 평가.
 
 ### 하드 제약
+
+### 업스트림 추가 입력 함정
+
+- **드롭/드로우/조준은 DRAG**(down+move+up), bare click 아님(머지 '드롭'=상단 드래그). 드래그는 인게임에서 잘 먹지만 bare click은 안 먹을 수 있다.
+- **시작 후 맹목 Space 금지**: Space가 일부 게임을 **PAUSE**시킨다(타이틀=시작, 인게임=일시정지일 수 있음 — 화면 우상단 `❚❚` 확인).
+- **헤드리스 맹점**: env-게이트 오토데모는 `_start_game()`를 *직접 호출* → 입력-시작 경로 우회 → 헤드리스는 시작/입력 버그를 **구조적으로 못 봄**. in-browser만이 잡는다.
+- 캔버스는 DOM이 아니라 canvas 렌더 → 점수/HUD는 DOM 스크랩 불가, **스크린샷 판독**으로만 평가.
+
+### 엔진별 예시: Godot 웹 빌드
+- **타이틀 `mouse_filter=STOP` 버그류 (실제 적발된 결함):** 타이틀 풀스크린 `ColorRect`/`Label`은 Godot 기본 `mouse_filter=STOP`이라 클릭/탭을 *삼켜* `_unhandled_input` 시작핸들러에 도달 못 함 → **키보드 Space만 시작**(터치기기엔 Space 없음 = 데드엔드). **증상: click/tap엔 시작 안 되고 Space엔 시작되면 이 버그.** 수정 = `_show_title()` 끝에 타이틀 Control(단 `Button` 제외)을 `MOUSE_FILTER_IGNORE`로.
+- **헤드리스 desktop Godot AUTOSHOTS는 일부 env서 GL 크래시**(rc139/segfault) → 웹빌드 in-browser로 대체.
+
+## 게임별 구동 제스처 (장르별 예시)
+bullet-heaven=드래그 이동(자동사격)·merge=상단 DRAG 드롭·onebutton=held click/Space 패리(타이밍 정밀=합성한계)·driver=←/→ 키·stacker=탭/Space 드롭·slingshot=당겨 DRAG-릴리즈(정밀조준=합성한계)·gridfit=트레이→격자 DRAG(픽업=합성한계)·ward=가로 DRAG 잉크배리어.
 
 - 비밀값 출력/커밋 금지 · 배포=사람승인 · 게임플레이 바이트 변경 시 author≠reviewer 독립리뷰 · 웹빌드 <20MB.
 - 합성입력 미진행을 결함으로 단정 금지(한계 표기) · 주관 손맛/음색/난이도는 오너 실기기 몫임을 명시.

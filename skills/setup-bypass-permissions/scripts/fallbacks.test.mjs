@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { pwshEnv, pwshVars } from '../../../scripts/test-fixtures/pwsh-env.mjs';
+import { symlinkSkip } from '../../../scripts/test-fixtures/can-symlink.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PY = join(HERE, 'fallback', 'bypass-permissions.py');
@@ -19,11 +21,17 @@ after(() => rmSync(root, { recursive: true, force: true }));
 
 const works = (bin, args) => spawnSync(bin, args, { encoding: 'utf8' }).status === 0;
 const python = ['python3', 'python'].find((bin) => works(bin, ['-c', 'import sys; assert sys.version_info >= (3, 6)']));
-const powershell = ['powershell', 'pwsh'].find((bin) => works(bin, ['-NoProfile', '-Command', 'exit 0']));
+// The PowerShell probes run with a temp home and the telemetry and update-check opt-outs (scripts/test-fixtures/pwsh-env.mjs).
+const PSE = pwshEnv();
+after(() => rmSync(PSE.home, { recursive: true, force: true }));
+const psWorks = (bin, args) => spawnSync(bin, args, { encoding: 'utf8', env: PSE.env }).status === 0;
+// Windows PowerShell 5.1 by its own path on Windows: a bare name is looked up in the current folder first there.
+const PS51 = process.platform === 'win32' ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell';
+const powershell = [PS51, 'pwsh'].find((bin) => psWorks(bin, ['-NoProfile', '-Command', 'exit 0']));
 const asRoot = process.platform !== 'win32' && process.getuid?.() === 0;
 const posix = process.platform !== 'win32';
 // PowerShell sets a file mode on macOS and Linux only where .NET has SetUnixFileMode (PowerShell 7.3+).
-const psModes = posix && powershell && works(powershell, ['-NoProfile', '-Command',
+const psModes = posix && powershell && psWorks(powershell, ['-NoProfile', '-Command',
   "if ($null -eq [System.IO.File].GetMethod('SetUnixFileMode', [type[]]@([string], [System.IO.UnixFileMode]))) { exit 1 }"]);
 
 // The two fallbacks behind one interface: run(c, ...args) as Claude, or a person, would run them.
@@ -52,10 +60,11 @@ const env = (c, extra = {}) => ({
   BANKER_BYPASS_TEST: '1',
   BANKER_BYPASS_POLICY_HOME: c.policyHome,
   IS_SANDBOX: '',
+  ...pwshVars(c.dir),
   ...extra,
 });
 const run = (shell, c, args, extra) => spawnSync(shell.bin, shell.args(...args), { encoding: 'utf8', env: env(c, extra) });
-const read = (c) => JSON.parse(readFileSync(c.settingsFile, 'utf8').replace(/^﻿/, ''));
+const read = (c) => JSON.parse(readFileSync(c.settingsFile, 'utf8').replace(/^\u{FEFF}/u, ''));
 const raw = (c) => readFileSync(c.settingsFile, 'utf8');
 
 test('the PowerShell fallback is ASCII only: Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page', () => {
@@ -140,7 +149,7 @@ for (const shell of SHELLS) {
     assert.equal(res.status, 1);
     assert.match(res.stderr, /20-lock\.json/);
     rmSync(join(c.policyHome, 'managed-settings.d'), { recursive: true });
-    writeFileSync(join(c.policyHome, 'managed-settings.json'), '﻿' + JSON.stringify({ permissions: { disableBypassPermissionsMode: true } }));
+    writeFileSync(join(c.policyHome, 'managed-settings.json'), '\u{FEFF}' + JSON.stringify({ permissions: { disableBypassPermissionsMode: true } }));
     assert.equal(run(shell, c, ['on', '--yes']).status, 1, 'a BOM before the policy JSON does not hide it');
   });
 
@@ -159,9 +168,9 @@ for (const shell of SHELLS) {
   });
 
   t('a BOM before the settings JSON is read and kept', {}, () => {
-    const c = setup('﻿' + JSON.stringify({ model: 'opus' }));
+    const c = setup('\u{FEFF}' + JSON.stringify({ model: 'opus' }));
     assert.equal(run(shell, c, ['on', '--yes']).status, 0);
-    assert.ok(raw(c).startsWith('﻿'));
+    assert.ok(raw(c).startsWith('\u{FEFF}'));
     assert.deepEqual(read(c), { model: 'opus', permissions: { defaultMode: 'bypassPermissions' } });
   });
 
@@ -206,7 +215,7 @@ for (const shell of SHELLS) {
     assert.equal(raw(c), c.text);
   });
 
-  t('a settings file reached through a link is changed where it lives, and the link stays', { skip: !posix && 'plain symlinks need POSIX' }, () => {
+  t('a settings file reached through a link is changed where it lives, and the link stays', { skip: symlinkSkip }, () => {
     const c = setup(null);
     const real = join(c.dir, 'dotfiles-settings.json');
     writeFileSync(real, JSON.stringify({ model: 'opus' }));
@@ -216,7 +225,7 @@ for (const shell of SHELLS) {
     assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')), { model: 'opus', permissions: { defaultMode: 'bypassPermissions' } });
   });
 
-  t('a link planted at the backup name is replaced, not written through', { skip: !posix && 'plain symlinks need POSIX' }, () => {
+  t('a link planted at the backup name is replaced, not written through', { skip: symlinkSkip }, () => {
     const c = setup();
     const victim = join(c.dir, 'victim.txt');
     writeFileSync(victim, 'keep me\n');
@@ -348,7 +357,7 @@ test('python: on refuses under root unless IS_SANDBOX=1 says this is a sandbox',
 for (const shell of SHELLS) {
   const t = (title, opts, fn) => test(`${shell.name}: ${title}`, { ...opts, skip: shell.skip || opts.skip }, fn);
 
-  t('a chain of links is followed to the file at its end, and every link stays', { skip: !posix && 'plain symlinks need POSIX' }, () => {
+  t('a chain of links is followed to the file at its end, and every link stays', { skip: symlinkSkip }, () => {
     const c = setup(null);
     const real = join(c.dir, 'real.json');
     const mid = join(c.dir, 'mid.json');
@@ -361,7 +370,7 @@ for (const shell of SHELLS) {
     assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')), { model: 'opus', permissions: { defaultMode: 'bypassPermissions' } });
   });
 
-  t('a settings file that is one of two hard links is still changed under its own name', { skip: !posix && 'hard links are checked on POSIX' }, () => {
+  t('a settings file that is one of two hard links is still changed under its own name', () => {
     const c = setup({ permissions: { defaultMode: 'bypassPermissions' }, model: 'opus' });
     linkSync(c.settingsFile, join(c.config, 'other-name.json'));
     const res = run(shell, c, ['off']);

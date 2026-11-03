@@ -26,7 +26,20 @@ const root = mkdtempSync(join(tmpdir(), "claude-update-last-test-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 
 // Links made without privileges and mode bits are POSIX matters; root ignores mode bits.
-const posixOnly = { skip: process.platform === "win32" && "Windows has no POSIX mode bits or plain symlinks" };
+// A file link needs a privilege on Windows, so the tests that make one run only where this account can.
+const canLinkFiles = (() => {
+  const probe = mkdtempSync(join(tmpdir(), "link-probe-"));
+  try {
+    writeFileSync(join(probe, "a"), "");
+    symlinkSync(join(probe, "a"), join(probe, "b"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+const fileLinks = { skip: !canLinkFiles && "this account cannot make file links" };
 const asRoot = process.platform !== "win32" && process.getuid?.() === 0;
 
 // Runnable stand-ins for omc-hud-custom.mjs: the lines the block relies on, laid
@@ -540,7 +553,7 @@ test("an unexpected failure partway exits 2, points at status and keeps the wrap
   assert.deepEqual(readdirSync(c.dir).filter((name) => name.endsWith(".tmp")), [], "the failed write's temp file is gone");
 });
 
-test("the backup is written fresh, never through a link planted at its name", posixOnly, () => {
+test("the backup is written fresh, never through a link planted at its name", fileLinks, () => {
   const c = setup();
   const victim = join(c.dir, "victim.txt");
   writeFileSync(victim, "keep me");
@@ -569,4 +582,138 @@ test("a wrapper that exists but cannot be read is not taken for a missing one", 
   } finally {
     chmodSync(c.hudFile, 0o644);
   }
+});
+
+// The bundled v4 wrapper (../assets/omc-hud-custom.mjs) as the sample: it already puts the notice
+// last as claude<running>→<latest>, so the block finds nothing to move and only has to come and go cleanly.
+const V4 = readFileSync(new URL("../assets/omc-hud-custom.mjs", import.meta.url), "utf8");
+// Stands in for omc-hud.mjs next to the wrapper, printing OMC 5.7.4's two lines and a hint below.
+const V4_OMC = [
+  "/work | branch:main",
+  "[OMC#5.7.4L] | \x1b[1m[Claude#2.1.300] -> 2.1.302 claude update\x1b[22m | Model: Opus 5.5 | session:42m | ctx:12% | 🔧14 🤖1 ⚡3",
+  "[!] claude 2.1.302 - paste: ! claude update",
+  "",
+].join("\n");
+const V4_LINE = "Op5.5/high|se:0.7h|ctx:12%|🤖1|🔧14|⚡3|/work|main|claude2.1.300→2.1.302";
+
+function setupV4(text = V4) {
+  const c = setup(text);
+  writeFileSync(join(c.dir, "omc-out.txt"), V4_OMC);
+  writeFileSync(join(c.dir, "omc-hud.mjs"),
+    'import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(new URL("./omc-out.txt", import.meta.url), "utf8"));\n');
+  return c;
+}
+// Renders the v4 wrapper as Claude Code does, with no width and no account file. `file` is the path
+// the statusLine command names, `transcript` the session file payload-mon sizes up (its cache stays in c.dir).
+function renderV4(c, { file = c.hudFile, transcript } = {}) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(COLUMNS|CLAUDE_CONFIG_DIR)$/i.test(k)));
+  const input = JSON.stringify({ effort: { level: "high" }, ...(transcript ? { transcript_path: transcript } : {}) });
+  const r = spawnSync(process.execPath, [file], {
+    input, env: { ...env, CLAUDE_CONFIG_DIR: c.dir, TMPDIR: c.dir, TEMP: c.dir, TMP: c.dir }, encoding: "utf8", timeout: 30000,
+  });
+  return r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
+}
+// payload-mon kept off the live config, as in the test above.
+const pmOf = (c) => ({
+  hudFile: c.hudFile,
+  cacheDir: join(c.dir, basename(CACHE_DIR)),
+  settingsFile: join(c.dir, "settings.json"),
+  projectsDir: join(c.dir, "projects"),
+  sessionId: "",
+});
+
+test("첨부 래퍼에 on 했다가 off 하면 바이트로 같음", () => {
+  const c = setupV4();
+  const on = turnOn(c);
+  assert.equal(on.ok, true, on.message);
+  assert.equal(markers(readFileSync(c.hudFile, "utf8")), 1);
+  const off = turnOff(c);
+  assert.equal(off.ok, true, off.message);
+  assert.equal(readFileSync(c.hudFile, "utf8"), V4);
+});
+
+test("BOM 으로 시작하는 첨부 래퍼도 on, off 하고 BOM 을 지킴", () => {
+  const BOM = String.fromCharCode(0xfeff);
+  const c = setupV4(BOM + V4);
+  const on = turnOn(c);
+  assert.equal(on.ok, true, on.message);
+  const text = readFileSync(c.hudFile, "utf8");
+  assert.equal(text.charCodeAt(0), 0xfeff);
+  assert.equal(markers(text), 1);
+  const off = turnOff(c);
+  assert.equal(off.ok, true, off.message);
+  assert.equal(readFileSync(c.hudFile, "utf8"), BOM + V4);
+});
+
+test("첨부 래퍼에 블록이 있어도 출력이 같고 갱신 안내는 한 번", () => {
+  const c = setupV4();
+  const before = renderV4(c);
+  assert.equal(before.split("\n")[0], V4_LINE);
+  assert.equal(turnOn(c).ok, true);
+  const after = renderV4(c);
+  assert.equal(after, before);
+  assert.doesNotMatch(after, /\[Claude#/);
+  assert.equal(after.split("claude2.1.300→2.1.302").length - 1, 1);
+});
+
+test("payload-mon on, claude-update-last on 뒤 둘 다 off 하면 첨부 래퍼와 바이트로 같음", () => {
+  const c = setupV4();
+  assert.equal(payloadMon.turnOn(pmOf(c)).ok, true);
+  assert.equal(turnOn(c).ok, true);
+  assert.equal(renderV4(c).split("\n")[0], V4_LINE);
+  assert.equal(turnOff(c).ok, true);
+  assert.equal(payloadMon.turnOff(pmOf(c)).ok, true);
+  assert.equal(readFileSync(c.hudFile, "utf8"), V4);
+});
+
+test("payload-mon on 의 안내가 첨부 래퍼 v4 에서 PL 칸을 말함", () => {
+  const res = payloadMon.turnOn(pmOf(setupV4()));
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /PL 칸에 요청 크기가 늘 표시됩니다/);
+  assert.doesNotMatch(res.message, /8MB/);
+});
+
+test("CRLF 로 바꾼 첨부 래퍼에도 두 블록이 들어가고 빠짐", () => {
+  const crlf = V4.replace(/\r?\n/g, "\r\n");
+  const c = setupV4(crlf);
+  assert.equal(payloadMon.turnOn(pmOf(c)).ok, true);
+  assert.equal(turnOn(c).ok, true);
+  const on = readFileSync(c.hudFile, "utf8");
+  // Both blocks keep the wrapper's CRLF.
+  assert.match(on, /\/\/ >>> claude-update-last >>>\r\n/);
+  assert.match(on, /\/\/ >>> payload-mon >>>\r\n/);
+  assert.doesNotMatch(on, /(^|[^\r])\n/);
+  assert.equal(markers(on), 1);
+  assert.equal(renderV4(c).split("\n")[0], V4_LINE);
+  assert.equal(turnOff(c).ok, true);
+  assert.equal(payloadMon.turnOff(pmOf(c)).ok, true);
+  assert.equal(readFileSync(c.hudFile, "utf8"), crlf);
+});
+
+test("래퍼 파일만 링크해도 첨부 래퍼 v4 가 PL 칸을 그림", fileLinks, () => {
+  // The real wrapper (with the omc-hud.mjs beside it) stays in c.dir; statusLine names a link elsewhere.
+  const c = setupV4();
+  const link = join(c.dir, "dotfiles-link", "omc-hud-custom.mjs");
+  mkdirSync(dirname(link));
+  symlinkSync(c.hudFile, link);
+  const res = payloadMon.turnOn({ ...pmOf(c), hudFile: link });
+  assert.equal(res.ok, true, res.message);
+  const transcript = join(c.dir, "session.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "user", message: { role: "user", content: "x".repeat(9 * 1024 * 1024) } }) + "\n");
+  const first = renderV4(c, { file: link, transcript }).split("\n")[0];
+  assert.match(first, /\|PL:9\.0M\|/);
+  assert.doesNotMatch(first, /payload:/);
+});
+
+test("CLAUDE_CONFIG_DIR 가 따옴표 안 ~/x 여도 홈 아래 래퍼를 씀", () => {
+  const c = setup();
+  const hudFile = join(c.dir, "x", "hud", "omc-hud-custom.mjs");
+  mkdirSync(dirname(hudFile), { recursive: true });
+  writeFileSync(hudFile, HUD_OLD);
+  // The installer (../assets/apply-hud.mjs) reads "~/x " as <home>/x; this tool must agree.
+  const env = cliEnv(c, { CLAUDE_UPDATE_LAST_HUD_FILE: "", CLAUDE_CONFIG_DIR: "~/x " });
+  const on = spawnSync(process.execPath, [CLI, "on"], { encoding: "utf8", env });
+  assert.equal(on.status, 0, on.stdout);
+  assert.equal(markers(readFileSync(hudFile, "utf8")), 1);
+  assert.equal(readFileSync(c.hudFile, "utf8"), HUD_OLD, "the wrapper outside that folder is untouched");
 });

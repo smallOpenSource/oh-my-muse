@@ -7,6 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
+import { symlinkSkip } from "../../../scripts/test-fixtures/can-symlink.mjs";
+
+// An inode number read as BigInt: NTFS file IDs pass 2^53 (seen on the Windows test box), and a Number loses the low bits.
+const inoOf = (p) => statSync(p, { bigint: true }).ino;
 
 const CLI = fileURLToPath(new URL("./bypass-permissions.mjs", import.meta.url));
 const root = mkdtempSync(join(tmpdir(), "bypass-permissions-test-"));
@@ -19,7 +23,7 @@ process.env.BANKER_BYPASS_POLICY_DIRS = join(root, "no-policy.d");
 const { status, turnOff, turnOn } = await import("./bypass-permissions.mjs");
 after(() => rmSync(root, { recursive: true, force: true }));
 
-const posixOnly = { skip: process.platform === "win32" && "Windows has no POSIX mode bits or plain symlinks" };
+const posixOnly = { skip: process.platform === "win32" && "Windows has no POSIX mode bits, owners, FIFOs or sockets" };
 const asRoot = process.platform !== "win32" && process.getuid?.() === 0;
 
 let seq = 0;
@@ -83,14 +87,14 @@ test("an empty or blank settings file reads as no settings", () => {
 test("the settings file is replaced whole, keeping its mode", posixOnly, () => {
   const c = setup();
   chmodSync(c.settingsFile, 0o640);
-  const ino = statSync(c.settingsFile).ino;
+  const ino = inoOf(c.settingsFile);
   const umask = process.umask(0o077); // a strict umask must not narrow the mode the file had
   try {
     assert.equal(turnOn(c).ok, true);
   } finally {
     process.umask(umask);
   }
-  assert.notEqual(statSync(c.settingsFile).ino, ino, "a new file renamed into place, never a half-written one");
+  assert.notEqual(inoOf(c.settingsFile), ino, "a new file renamed into place, never a half-written one");
   assert.equal(statSync(c.settingsFile).mode & 0o777, 0o640);
   assert.equal(readdirSync(c.dir).filter((f) => f.endsWith(".tmp")).length, 0, "no temp file left");
 });
@@ -211,7 +215,7 @@ test("the text from before each change is kept in a backup only this account can
   if (process.platform !== "win32") assert.equal(statSync(bakOf(c)).mode & 0o777, 0o600);
 });
 
-test("a settings file reached through a link is changed where it lives, and the link stays", posixOnly, () => {
+test("a settings file reached through a link is changed where it lives, and the link stays", { skip: symlinkSkip }, () => {
   const c = setup(null);
   const real = join(c.dir, "dotfiles-settings.json");
   writeFileSync(real, JSON.stringify({ model: "opus" }));
@@ -414,7 +418,7 @@ test("off takes back the record on wrote", () => {
   assert.equal(existsSync(recordOf(c)), false);
 });
 
-test("a link planted at the backup's name is replaced, not written through", posixOnly, () => {
+test("a link planted at the backup's name is replaced, not written through", { skip: symlinkSkip }, () => {
   const c = setup();
   const target = join(c.dir, "elsewhere.txt");
   writeFileSync(target, "keep me\n");

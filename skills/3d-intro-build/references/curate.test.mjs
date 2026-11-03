@@ -14,6 +14,7 @@ import {
   archiveRejected, hashFile, readDecisions, readInput, recordDecision, renderPage, startCurate,
 } from './curate.mjs';
 import { readState, stopServer } from './preview-lib.mjs';
+import { canSymlink, symlinkSkip } from '../../../scripts/test-fixtures/can-symlink.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = new Date('2026-10-10T03:00:00Z');
@@ -74,7 +75,7 @@ test('a take is hashed in chunks, hashed anew once its file changes, and a folde
   await assert.rejects(hashFile(path.join(dir, 'missing.mp4')), { code: 'ENOENT' });
 });
 
-test('a device is never read for a hash, and a take linked to one is refused before that', { skip: process.platform === 'win32' && 'symlinks need a privilege on Windows', timeout: 10_000 }, async () => {
+test('a device is never read for a hash, and a take linked to one is refused before that', { skip: process.platform === 'win32' && '/dev/zero is a POSIX device', timeout: 10_000 }, async () => {
   await assert.rejects(hashFile('/dev/zero'), /일반 파일 아님/);
   const dir = project();
   fs.symlinkSync('/dev/zero', path.join(dir, 'clips/zero.mp4'));
@@ -91,7 +92,7 @@ test('a listed file that is not an image or a video, or that links out of the pr
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'curate-out-'));
   made.push(outside);
   fs.writeFileSync(path.join(outside, 'leak.png'), 'from outside');
-  const links = process.platform !== 'win32';
+  const links = canSymlink;
   if (links) {
     fs.symlinkSync(path.join(outside, 'leak.png'), path.join(dir, 'stills', 'link.png'));
     fs.symlinkSync(path.join(dir, '.env.3d-intro.local'), path.join(dir, 'stills', 'inner.png'));
@@ -143,7 +144,7 @@ test('a request body with control characters reaches the server log escaped', as
   assert.ok(logged.length > 0 && logged.every((l) => !/[\u001b\u007f\u009b\u0085\u202e]/.test(l)), JSON.stringify(logged));
 });
 
-test('archiving moves no file that a folder link leads out of the project', { skip: process.platform === 'win32' && 'symlinks need a privilege on Windows' }, () => {
+test('archiving moves no file that a folder link leads out of the project', { skip: symlinkSkip }, () => {
   const dir = project();
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'curate-out-'));
   made.push(outside);
@@ -489,4 +490,75 @@ test('an archived take lands inside the dated folder whatever the spelling of it
   const [move] = archiveRejected(dir, { now: NOW });
   assert.match(move.to, /^rejected-\d{8}\/stills\/s1-t1\.png$/);
   assert.ok(fs.existsSync(path.join(dir, ...move.to.split('/'))));
+});
+
+test('a listed file swapped for a link after its check is not served from where the link leads', { skip: symlinkSkip }, async (t) => {
+  const dir = project();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'curate-out-'));
+  made.push(outside);
+  fs.writeFileSync(path.join(outside, 'leak.png'), 'from outside');
+  const s = await startCurate(dir, {});
+  t.after(() => s.close());
+  const listed = path.join(dir, 'stills', 's1-t1.png');
+  const open = fs.openSync;
+  fs.openSync = (p, ...rest) => {
+    if (p === listed) { // the race: the path changes between the link check and the open
+      fs.openSync = open;
+      fs.rmSync(listed);
+      fs.symlinkSync(path.join(outside, 'leak.png'), listed);
+    }
+    return open(p, ...rest);
+  };
+  t.after(() => { fs.openSync = open; });
+  const r = await fetch(`http://127.0.0.1:${s.port}/stills/s1-t1.png`);
+  const body = await r.text();
+  assert.equal(r.status, 404);
+  assert.notEqual(body, 'from outside');
+  assert.equal(fs.openSync, open, 'the open went through the swap');
+  // the same swap inside the check, right after the links were followed: the file it records is the link
+  const other = path.join(dir, 'stills', 's1-t2.png');
+  const realpath = fs.realpathSync;
+  fs.realpathSync = (p, ...rest) => {
+    const real = realpath(p, ...rest);
+    if (p === other) {
+      fs.realpathSync = realpath;
+      fs.rmSync(other);
+      fs.symlinkSync(path.join(outside, 'leak.png'), other);
+    }
+    return real;
+  };
+  t.after(() => { fs.realpathSync = realpath; });
+  const r2 = await fetch(`http://127.0.0.1:${s.port}/stills/s1-t2.png`);
+  assert.equal(r2.status, 404);
+  assert.notEqual(await r2.text(), 'from outside');
+  assert.equal(fs.realpathSync, realpath, 'the check went through the swap');
+});
+
+// 0.20.4 last cleanup: a 64-bit file id (NTFS) is compared whole
+test('a listed file swapped for another whose 64-bit file id reads as the same Number is still told apart', async (t) => {
+  const dir = project();
+  const s = await startCurate(dir, {});
+  t.after(() => s.close());
+  const listed = path.join(dir, 'stills', 's1-t1.png');
+  const real = fs.realpathSync(listed);
+  // past 2^53 a Number drops the low bits of an id, so these two read as one
+  const ID_A = 2n ** 60n + 1n;
+  const ID_B = 2n ** 60n + 2n;
+  const withIno = (st, id, opts) => Object.setPrototypeOf({ ...st, ino: opts?.bigint ? id : Number(id) }, Object.getPrototypeOf(st));
+  const { lstatSync, fstatSync, openSync } = fs;
+  t.after(() => Object.assign(fs, { lstatSync, fstatSync, openSync }));
+  fs.lstatSync = (p, opts) => (p === real ? withIno(lstatSync(p, opts), ID_A, opts) : lstatSync(p, opts));
+  fs.fstatSync = (fd, opts) => withIno(fstatSync(fd, opts), ID_B, opts);
+  fs.openSync = (p, ...rest) => {
+    if (p === listed) { // the path changes between its check and the open
+      fs.openSync = openSync;
+      fs.rmSync(listed);
+      fs.writeFileSync(listed, 'SWAPPED IN');
+    }
+    return openSync(p, ...rest);
+  };
+  const r = await fetch(`http://127.0.0.1:${s.port}/stills/s1-t1.png`);
+  const body = await r.text();
+  assert.equal(r.status, 404);
+  assert.notEqual(body, 'SWAPPED IN');
 });

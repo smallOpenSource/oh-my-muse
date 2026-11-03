@@ -5,12 +5,9 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { after, test } from "node:test";
-import {
-  checkBox, installStop, loadBoxes, main, nodeTestCommand, parseArgs, parseTap, probeBox, remoteSteps, runOnBox, runScript,
-  scpBase, spawnExec, sshBase,
-} from "./boxes.mjs";
+import { checkBox, installStop, loadBoxes, main, nodeTestCommand, parseArgs, parseTap, probeBox, remoteSteps, runOnBox, runScript, scpBase, spawnExec, sshBase } from "./boxes.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "remains-boxes-test-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -95,10 +92,20 @@ test("the run script records its process id, enters the tree, adds the box's PAT
   assert.ok(!runScript(ROCKY, "repo", "x").text.includes("PATH="), "no PATH line without entries");
 });
 
-test("on Windows the command runs from a .cmd file through call, with CRLF line ends and its exit code", () => {
+test("on Windows the command runs from a UTF-8 .cmd file through call, with CRLF line ends and its exit code", () => {
   const s = runScript(WIN, "repo", "npm test");
   assert.equal(s.ext, ".cmd");
-  assert.equal(s.text, '@echo off\r\ncd /d "%~dp0repo" || exit /b 97\r\ncall npm test\r\nexit /b %ERRORLEVEL%\r\n');
+  assert.equal(s.text, '@echo off\r\nchcp 65001 >nul 2>&1\r\ncd /d "%~dp0repo" || exit /b 97\r\ncall npm test\r\nexit /b %ERRORLEVEL%\r\n');
+  // cmd reads the lines in the code page chcp set: a Korean argument stays as written
+  assert.ok(runScript(WIN, "repo", 'node --test --test-name-pattern="잠금" a.test.mjs').text.includes('\r\ncall node --test --test-name-pattern="잠금" a.test.mjs\r\n'));
+});
+
+test("on Windows for, if and a ( block go without call, which cannot run them; other commands go through call", () => {
+  const line = (c) => runScript(WIN, "repo", c).text.split("\r\n")[3];
+  for (const c of ["for /L %%i in (1,1,3) do echo %%i", "FOR %%f in (*.mjs) do call npm test", "if exist a.txt echo yes", "If/i a==A echo x", "  (echo a & echo b)"]) {
+    assert.equal(line(c), c, c);
+  }
+  for (const c of ["format-check", "iffy.cmd", "forge test", "node -e \"if (1) {}\""]) assert.equal(line(c), `call ${c}`, c);
 });
 
 test("node test commands quote each file for the box's shell", () => {
@@ -410,3 +417,11 @@ test("spawnExec reports a missing program and a timeout without hanging", async 
   assert.equal(slow.timedOut, true);
   assert.ok(Date.now() - t0 < 5000, "returns soon after the limit");
 });
+
+test("identity: a relative key path is made absolute against the run's folder (ssh starts in the home folder), a path from ~ stays for OpenSSH", () => {
+  const args = (identity) => { const a = sshBase({ name: "b", os: "linux", ssh: "u@h", identity }); return a[a.indexOf("-i") + 1]; };
+  assert.equal(args("keys/k"), resolve("keys/k"));
+  assert.equal(args("~/.ssh/k"), "~/.ssh/k");
+  assert.equal(args("/abs/k"), "/abs/k", "an absolute path stays as written");
+});
+

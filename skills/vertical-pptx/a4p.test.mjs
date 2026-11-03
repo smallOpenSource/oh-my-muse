@@ -4,7 +4,7 @@
  *
  * TWO TIERS, and the difference is deliberate.
  *
- *   Tier 1 (standing).  U1..U16. node:test + node:assert + node stdlib, nothing else. CI installs
+ *   Tier 1 (standing).  U1..U20. node:test + node:assert + node stdlib, nothing else. CI installs
  *     neither pptxgenjs nor python-pptx, so anything that needs a builder cannot be a regression
  *     gate. Everything here calls layout()/mdToDeck() out of build_a4p.js and the verifier's
  *     exported functions directly, against fixtures this file builds byte by byte.
@@ -16,7 +16,8 @@
  *
  *     Builder discovery: pptxgenjs through build_a4p.js's own moduleSearchPaths() (so NODE_PATH
  *     works), python through $A4P_PYTHON, then $PYTHON, then python3 / python / python3.12, taking
- *     the first interpreter that can `import pptx` (PYTHONPATH is inherited).
+ *     the first interpreter that is python 3.9 or newer (build_a4p.py's MIN_PYTHON) and can
+ *     `import pptx` (PYTHONPATH is inherited). An older one would only exit 2.
  *
  * THE FIXTURE WRITER IS INDEPENDENT ON PURPOSE.
  *   verify_a4p.mjs exports writeZip() and crc32(). Neither is used to build a fixture here. If the
@@ -27,7 +28,8 @@
  *   with an advance table chosen so every expected width is exact rather than approximately right.
  *
  * No file is ever written inside the repo: everything transient lands in one mkdtemp under
- * os.tmpdir() and is removed in after().
+ * os.tmpdir() and is removed in after(). The one exception is U19's folder link, which sits in a
+ * mkdtemp of its own and is removed by U19 itself, so the recursive delete never meets it.
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -40,6 +42,7 @@ import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 
 import * as V from './verify_a4p.mjs';
+import { symlinkSkip } from '../../scripts/test-fixtures/can-symlink.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -51,13 +54,21 @@ const BUILD_PY = path.join(HERE, 'build_a4p.py');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'a4p-test-'));
 const tmp = (name) => path.join(TMP, name);
 
-// A python run can leave a __pycache__ beside the script it imported from. build_a4p.py imports
-// nothing local so this should stay empty, but the repo has to come out of a test run unchanged.
+// fontconfig keeps its cache in $XDG_CACHE_HOME/fontconfig (~/.cache/fontconfig when that is unset), and fc-match, which
+// verify_a4p.mjs and both builders run here and in children, writes there when a font folder's system cache is out of
+// date. Pointed into TMP for this run, then put back.
+const XDG_CACHE_HOME = process.env.XDG_CACHE_HOME;
+process.env.XDG_CACHE_HOME = tmp('xdg-cache');
+
+// A python run can leave a __pycache__ beside the script it imported from. U18b imports build_a4p.py, with -B so no
+// bytecode is written, but the repo has to come out of a test run unchanged.
 // Only a directory this run created is removed; one that was already there is left alone.
 const PYCACHE = path.join(HERE, '__pycache__');
 const PYCACHE_PREEXISTING = fs.existsSync(PYCACHE);
 
 after(() => {
+  if (XDG_CACHE_HOME === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = XDG_CACHE_HOME;
   fs.rmSync(TMP, { recursive: true, force: true });
   if (!PYCACHE_PREEXISTING) fs.rmSync(PYCACHE, { recursive: true, force: true });
 });
@@ -102,53 +113,65 @@ function makeZip(entries) {
     const method = e.store ? 0 : 8;
     const body = method === 0 ? data : zlib.deflateRawSync(data);
     const name = Buffer.from(e.name, 'utf8');
-    const crc = crc32(data);
-
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(LOC_SIG, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0, 6); // no data descriptor: sizes are known here
-    local.writeUInt16LE(method, 8);
-    local.writeUInt16LE(0, 10);
-    local.writeUInt16LE(0x0021, 12); // 1980-01-01
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(body.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    local.writeUInt16LE(0, 28);
-    chunks.push(local, name, body);
-
-    const cen = Buffer.alloc(46);
-    cen.writeUInt32LE(CEN_SIG, 0);
-    cen.writeUInt16LE(20, 4);
-    cen.writeUInt16LE(20, 6);
-    cen.writeUInt16LE(0, 8);
-    cen.writeUInt16LE(method, 10);
-    cen.writeUInt16LE(0, 12);
-    cen.writeUInt16LE(0x0021, 14);
-    cen.writeUInt32LE(crc, 16);
-    cen.writeUInt32LE(body.length, 20);
-    cen.writeUInt32LE(data.length, 24);
-    cen.writeUInt16LE(name.length, 28);
-    cen.writeUInt16LE(0, 30);
-    cen.writeUInt16LE(0, 32);
-    cen.writeUInt16LE(0, 34);
-    cen.writeUInt16LE(0, 36);
-    cen.writeUInt32LE(0, 38);
-    cen.writeUInt32LE(offset, 42);
-    central.push(cen, name);
-
+    const f = { method, crc: crc32(data), packed: body.length, size: data.length, nameLength: name.length };
+    chunks.push(localHeader(f), name, body);
+    central.push(centralHeader(f, offset), name);
     offset += 30 + name.length + body.length;
   }
 
   const cd = Buffer.concat(central);
+  return Buffer.concat([...chunks, cd, endOfCentral(entries.length, cd.length, offset)]);
+}
+
+// The 30-byte local file header of one entry (`f`: method, crc, packed and plain sizes, name length).
+function localHeader(f) {
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(LOC_SIG, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(0, 6); // no data descriptor: sizes are known here
+  local.writeUInt16LE(f.method, 8);
+  local.writeUInt16LE(0, 10);
+  local.writeUInt16LE(0x0021, 12); // 1980-01-01
+  local.writeUInt32LE(f.crc, 14);
+  local.writeUInt32LE(f.packed, 18);
+  local.writeUInt32LE(f.size, 22);
+  local.writeUInt16LE(f.nameLength, 26);
+  local.writeUInt16LE(0, 28);
+  return local;
+}
+
+// The 46-byte central directory record of one entry whose local header sits at `offset`.
+function centralHeader(f, offset) {
+  const cen = Buffer.alloc(46);
+  cen.writeUInt32LE(CEN_SIG, 0);
+  cen.writeUInt16LE(20, 4);
+  cen.writeUInt16LE(20, 6);
+  cen.writeUInt16LE(0, 8);
+  cen.writeUInt16LE(f.method, 10);
+  cen.writeUInt16LE(0, 12);
+  cen.writeUInt16LE(0x0021, 14);
+  cen.writeUInt32LE(f.crc, 16);
+  cen.writeUInt32LE(f.packed, 20);
+  cen.writeUInt32LE(f.size, 24);
+  cen.writeUInt16LE(f.nameLength, 28);
+  cen.writeUInt16LE(0, 30);
+  cen.writeUInt16LE(0, 32);
+  cen.writeUInt16LE(0, 34);
+  cen.writeUInt16LE(0, 36);
+  cen.writeUInt32LE(0, 38);
+  cen.writeUInt32LE(offset, 42);
+  return cen;
+}
+
+// The 22-byte end of central directory: entry counts, the directory's length and where it starts.
+function endOfCentral(count, cdLength, cdOffset) {
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(EOCD_SIG, 0);
-  eocd.writeUInt16LE(entries.length, 8);
-  eocd.writeUInt16LE(entries.length, 10);
-  eocd.writeUInt32LE(cd.length, 12);
-  eocd.writeUInt32LE(offset, 16);
-  return Buffer.concat([...chunks, cd, eocd]);
+  eocd.writeUInt16LE(count, 8);
+  eocd.writeUInt16LE(count, 10);
+  eocd.writeUInt32LE(cdLength, 12);
+  eocd.writeUInt32LE(cdOffset, 16);
+  return eocd;
 }
 
 /**
@@ -397,44 +420,60 @@ function cmapTable(subs) {
  * which is what makes a ttcf possible: table offsets are absolute, never face-relative.
  */
 function buildSfnt(spec, baseOffset = 0) {
-  const { unitsPerEm, numGlyphs, advances, subs, family, fullName } = spec;
+  const { family, fullName } = spec;
+  const tables = new Map([
+    ['cmap', cmapTable(spec.subs)],
+    ['head', headTable(spec)],
+    ['hhea', hheaTable(spec)],
+    ['hmtx', hmtxTable(spec)],
+    ['maxp', maxpTable(spec)],
+    ['name', nameTable([{ nameID: 1, value: family }, { nameID: 4, value: fullName || family }])],
+  ]);
+  return tableDirectory(tables, baseOffset);
+}
 
+function headTable(spec) {
   const head = Buffer.alloc(54);
   head.writeUInt32BE(0x00010000, 0);
   head.writeUInt32BE(0x00010000, 4);
   head.writeUInt32BE(0x5f0f3cf5, 12); // magic
   head.writeUInt16BE(3, 16);
-  head.writeUInt16BE(unitsPerEm, 18);
+  head.writeUInt16BE(spec.unitsPerEm, 18);
   head.writeUInt16BE(spec.macStyle || 0, 44);
   head.writeUInt16BE(8, 46);
   head.writeInt16BE(2, 48);
+  return head;
+}
 
+function hheaTable(spec) {
   const hhea = Buffer.alloc(36);
   hhea.writeUInt32BE(0x00010000, 0);
   hhea.writeInt16BE(spec.ascender, 4);
   hhea.writeInt16BE(spec.descender, 6);
   hhea.writeInt16BE(spec.lineGap || 0, 8);
-  hhea.writeUInt16BE(advances.length, 34); // numberOfHMetrics
+  hhea.writeUInt16BE(spec.advances.length, 34); // numberOfHMetrics
+  return hhea;
+}
 
+function maxpTable(spec) {
   const maxp = Buffer.alloc(6);
   maxp.writeUInt32BE(0x00005000, 0);
-  maxp.writeUInt16BE(numGlyphs, 4);
+  maxp.writeUInt16BE(spec.numGlyphs, 4);
+  return maxp;
+}
 
+function hmtxTable({ advances, numGlyphs }) {
   const hmtx = Buffer.alloc(advances.length * 4 + Math.max(0, numGlyphs - advances.length) * 2);
   advances.forEach((a, i) => {
     hmtx.writeUInt16BE(a, i * 4);
     hmtx.writeInt16BE(0, i * 4 + 2);
   });
+  return hmtx;
+}
 
-  const tables = new Map([
-    ['cmap', cmapTable(subs)],
-    ['head', head],
-    ['hhea', hhea],
-    ['hmtx', hmtx],
-    ['maxp', maxp],
-    ['name', nameTable([{ nameID: 1, value: family }, { nameID: 4, value: fullName || family }])],
-  ]);
-
+// The face's table directory and the tables after it, each padded to 4 bytes. Offsets are absolute: the
+// directory sits at `baseOffset` in the final file.
+function tableDirectory(tables, baseOffset) {
   const tags = [...tables.keys()].sort();
   const dir = Buffer.alloc(12 + tags.length * 16);
   const es = Math.floor(Math.log2(tags.length));
@@ -1038,6 +1077,154 @@ test('U18 every font-file hint is a substring of the family it belongs to', () =
   assert.ok(B.FONT_CHAIN.includes('Noto Sans KR'));
 });
 
+// U18b: the python builder picks a font the way the node builder does. The fix above went into build_a4p.js only, so on
+// a Windows box with NotoSansKR-VF.ttf and no CJK font the python builder still wrote "Noto Sans CJK KR" (E1 measured
+// it, 2026-10-28). build_a4p.py loads without python-pptx, so this needs python 3.9 or newer and nothing else.
+const PY_MODULE_PROBE = 'import sys; sys.exit(3) if sys.version_info < (3, 9) else None';
+const pythonModule = (() => {
+  const candidates = [process.env.A4P_PYTHON, process.env.PYTHON, 'python3', 'python', 'python3.12', 'python3.11', 'python3.10'].filter(Boolean);
+  const bin = candidates.find((c) => spawnSync(c, ['-c', PY_MODULE_PROBE], { encoding: 'utf8' }).status === 0);
+  return bin ? { ok: true, bin } : { ok: false, reason: `no interpreter among [${candidates.join(', ')}] is python 3.9 or newer` };
+})();
+
+const PY_FONT_PROBE = String.raw`
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import build_a4p as b
+base = sys.argv[2]
+def folder(name, files):
+    d = os.path.join(base, name)
+    os.makedirs(d)
+    for n in files:
+        open(os.path.join(d, n), 'wb').close()
+    return d
+# A file system that lists the bold cut first, so a first-hit search would take it whatever the real disk does.
+real_scandir = os.scandir
+os.scandir = lambda p: iter(sorted(real_scandir(p), key=lambda e: ('bold' not in e.name.lower(), e.name)))
+main = folder('main', ('NotoSans-Regular.ttf', 'NotoSansKR-Bold.ttf', 'NotoSansKR-VF.ttf'))
+out = {'chain': list(b.FONT_CHAIN), 'hints': {k: list(v) for k, v in b.FONT_FILE_HINTS.items()}}
+b.font_search_dirs = lambda: [main]
+latin = os.path.join(main, 'NotoSans-Regular.ttf')
+b.fc_match = lambda pattern: {'file': latin, 'families': ['Noto Sans']}
+out['cjkFromLatin'] = b.find_font_file('Noto Sans CJK KR')
+out['noAscii'] = b.find_font_file('맑은 고딕')
+b.fc_match = lambda pattern: {'file': latin, 'families': ['NanumGothic', '나눔고딕']}
+out['koreanFamily'] = [b.find_font_file('나눔고딕') == latin, b.find_font_file('맑은 고딕')]
+b.fc_match = lambda pattern: None
+out['kr'] = os.path.basename(b.find_font_file('Noto Sans KR') or '')
+os.environ.pop('BANKER_PPTX_FONT', None)
+out['auto'] = b.resolve_font(None, 'auto')['name']
+r = b.resolve_font(' Noto "Sans<> KR\x01 ', 'auto')
+out['explicit'] = [r['name'], r['from']]
+r = b.resolve_font('없는폰트', 'auto')
+out['notFound'] = [r['name'], [w['code'] for w in r['warnings']]]
+out['trim'] = b.sanitize_font_name('\ufeff Noto Sans KR\x85 ')
+b.font_search_dirs = lambda: [folder('ties', ('NotoSansKR-VF.ttf', 'NotoSansKR.ttf'))]
+out['shorter'] = os.path.basename(b.find_font_file('Noto Sans KR') or '')
+first, second = folder('first', ('NotoSansKR-Bold.ttf',)), folder('second', ('NotoSansKR-Regular.ttf',))
+b.font_search_dirs = lambda: [first, second]
+out['firstFolder'] = os.path.relpath(b.find_font_file('Noto Sans KR') or '', base)
+print(json.dumps(out))
+`;
+
+test('U18b the python builder carries the node chain and hints, checks a family one way, and prefers the regular file', (t) => {
+  if (!pythonModule.ok) {
+    if (process.env.A4P_REQUIRE_BUILDERS === '1') assert.fail(`${pythonModule.reason} (A4P_REQUIRE_BUILDERS=1)`);
+    t.skip(pythonModule.reason);
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(TMP, 'u18b-'));
+  const r = spawnSync(pythonModule.bin, ['-B', '-c', PY_FONT_PROBE, HERE, dir], { encoding: 'utf8', cwd: TMP });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.deepEqual(got.chain, B.FONT_CHAIN, 'the same chain, in the same order');
+  assert.deepEqual(got.hints, B.FONT_FILE_HINTS, 'the same file hints');
+  assert.equal(got.cjkFromLatin, null, 'fc-match answering "Noto Sans" for "Noto Sans CJK KR" is a substitute, not a hit');
+  assert.equal(got.noAscii, null, 'a name with no ASCII letter has nothing to compare, so nothing matches it');
+  assert.deepEqual(got.koreanFamily, [true, null], 'a Korean name matches only a family fc-match spells the same way');
+  assert.equal(got.kr, 'NotoSansKR-VF.ttf', 'the regular cut before the bold one, though the folder lists the bold one first');
+  assert.equal(got.shorter, 'NotoSansKR.ttf', 'between two of one rank, the shorter name');
+  assert.equal(got.firstFolder, path.join('first', 'NotoSansKR-Bold.ttf'), 'a hit in an earlier font folder wins');
+  assert.equal(got.auto, 'Noto Sans KR', 'a box with only NotoSansKR-VF.ttf gets the name that is installed');
+  assert.deepEqual(got.explicit, ['Noto Sans KR', '--font'], 'a --font name is cleaned as the node builder cleans it');
+  assert.deepEqual(got.notFound, ['Noto Sans KR', ['FONT_NOT_FOUND']], 'a name that is not there is reported, then the chain decides');
+  assert.equal(got.trim, B.sanitizeFontName('\ufeff Noto Sans KR\x85 '), 'the ends are trimmed as JavaScript trims them');
+});
+
+// U18c runs the lookups with no fc-match on PATH, so a machine whose fc-match knows 맑은 고딕 cannot answer for it, and
+// checks the hint table rather than the disk, so a font whose file name holds "proto" cannot either.
+test('U18c the node builder finds nothing for a name with no ASCII letter, and a hint lookup reads no inherited key', () => {
+  const probe = `const B = require(${JSON.stringify(BUILD_JS)});
+    const names = ['constructor', '__proto__', 'toString'];
+    console.log(JSON.stringify({
+      korean: B.findFontFile('\\ub9d1\\uc740 \\uace0\\ub515'),
+      hints: names.map((n) => [n, B.fontHints(n)]),
+      resolved: names.map((n) => {
+        const r = B.resolveFont({ fontArg: n, metaFont: 'auto' });
+        // A machine may hold a font whose file name has the hint in it; the answer must then agree with the lookup.
+        return [n, B.findFontFile(n) ? r.from === '--font' : r.from !== '--font' && r.warnings[0]?.code === 'FONT_NOT_FOUND' && r.warnings[0]?.detail === n];
+      }),
+    }));`;
+  const empty = fs.mkdtempSync(path.join(TMP, 'u18c-'));
+  const r = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', env: { ...process.env, PATH: empty } });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout.trim());
+  assert.equal(got.korean, null, 'no fc-match to spell the family, and no file name to compare: nothing');
+  assert.deepEqual(got.hints, [['constructor', ['constructor']], ['__proto__', ['proto']], ['toString', ['tostring']]], 'the name itself, not what Object carries');
+  assert.deepEqual(got.resolved, [['constructor', true], ['__proto__', true], ['toString', true]], 'resolveFont takes the name only when the lookup found it, and says FONT_NOT_FOUND otherwise');
+});
+
+// The node builder's Dirent calls a linked folder a link, a Windows junction too, and does not enter it. python before
+// 3.12 calls a junction a folder, so the python builder checks for a reparse point itself. The link here is a junction
+// on Windows (no admin rights needed); elsewhere 'junction' is ignored and it is a folder symlink.
+const PY_LINKED_PROBE = String.raw`
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import build_a4p as b
+b.fc_match = lambda pattern: None
+b.font_search_dirs = lambda: [sys.argv[2]]
+linked = b.find_font_file('Noto Sans KR')
+b.font_search_dirs = lambda: [sys.argv[3]]
+print(json.dumps([linked, b.find_font_file('Noto Sans KR')]))
+`;
+test('U18e the python builder does not enter a linked font folder, a Windows junction among them, and does enter a real one', (t) => {
+  if (!pythonModule.ok) {
+    if (process.env.A4P_REQUIRE_BUILDERS === '1') assert.fail(`${pythonModule.reason} (A4P_REQUIRE_BUILDERS=1)`);
+    t.skip(pythonModule.reason);
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(TMP, 'u18e-'));
+  const elsewhere = path.join(dir, 'elsewhere');
+  fs.mkdirSync(elsewhere);
+  fs.writeFileSync(path.join(elsewhere, 'NotoSansKR-Regular.ttf'), '');
+  const linkedRoot = path.join(dir, 'linked');
+  fs.mkdirSync(linkedRoot);
+  fs.symlinkSync(elsewhere, path.join(linkedRoot, 'sub'), 'junction');
+  const realRoot = path.join(dir, 'real');
+  fs.mkdirSync(path.join(realRoot, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(realRoot, 'sub', 'NotoSansKR-Regular.ttf'), '');
+  const r = spawnSync(pythonModule.bin, ['-B', '-c', PY_LINKED_PROBE, HERE, linkedRoot, realRoot], { encoding: 'utf8', cwd: TMP });
+  assert.equal(r.status, 0, r.stderr);
+  const [linked, real] = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.equal(linked, null, 'a font behind a linked folder is not found');
+  assert.equal(real, path.join(realRoot, 'sub', 'NotoSansKR-Regular.ttf'), 'a font in a real subfolder is');
+});
+
+// A Korean family name has no ASCII letter to compare, so fc-match's answer must spell it exactly. The stand-in
+// fc-match answers every pattern with one file whose families are NanumGothic and 나눔고딕.
+test('U18d the node builder takes a Korean name only when fc-match returns that family', { skip: process.platform === 'win32' && 'the stand-in fc-match is a sh script' }, () => {
+  const bin = fs.mkdtempSync(path.join(TMP, 'u18d-'));
+  const font = path.join(bin, 'NanumGothic.ttf');
+  fs.writeFileSync(font, '');
+  const shQuoted = `'${font.replace(/'/g, `'\\''`)}'`;
+  fs.writeFileSync(path.join(bin, 'fc-match'), `#!/bin/sh\nprintf '%s|NanumGothic,나눔고딕' ${shQuoted}\n`, { mode: 0o755 });
+  const probe = `const B = require(${JSON.stringify(BUILD_JS)});
+    console.log(JSON.stringify([B.findFontFile('나눔고딕'), B.findFontFile('맑은 고딕')]));`;
+  const r = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim()), [font, null]);
+});
+
 // ===========================================================================
 // U17 — meta.title length: the two builders must agree
 // ===========================================================================
@@ -1051,7 +1238,7 @@ test('U18 every font-file hint is a substring of the family it belongs to', () =
 // This lives in the standing tier on purpose: E1/E1b compare the builders but are
 // tier 2, so they never run in CI, and this axis would otherwise have no gate at all.
 
-test('U17 meta.title clamps at the core-property limit, identically in both builders', () => {
+test('U17 meta.title clamps at the core-property limit, counted in code points as python counts', () => {
   assert.equal(B.CORE_TITLE_MAX, 255, 'the cap is the python-pptx core property limit');
 
   const under = 'ㄱ'.repeat(255);
@@ -1086,13 +1273,14 @@ test('U17 meta.title clamps at the core-property limit, identically in both buil
   assert.equal(cutAstral.length, 256, 'the reported length is code points, so detail matches python');
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cutAstral.value),
     'a lone high surrogate means the cut split a pair and broke the last character');
+});
 
-
+test('U17b both builders carry the same title cap and warning code', () => {
   // The python side must carry the same constant and the same warning code. Reading the
   // source keeps this in the dependency-free tier: no interpreter required.
   const py = fs.readFileSync(path.join(HERE, 'build_a4p.py'), 'utf8');
   assert.match(py, /CORE_TITLE_MAX\s*=\s*255/, 'python must clamp at the same length');
-  assert.match(py, /'code':\s*'TITLE_TRUNCATED'/, 'python must emit the same warning code');
+  assert.match(py, /(['"])code\1:\s*(['"])TITLE_TRUNCATED\2/, 'python must emit the same warning code');
   assert.match(py, /except ValueError as err:\s*\n\s*raise UsageError/,
     'a library refusal must become UsageError (exit 3), never a raw traceback');
 
@@ -1134,6 +1322,19 @@ test('U12 exit codes: 0 pass, 1 verification failure, 2 environment missing, 3 u
   const slotSplit = fixtureFile('exit-slots', makePptx({ slides: [[{ ...FIT_SHAPE, ea: null }]] }));
   assert.equal(quiet(() => V.main([slotSplit])).value, 0);
   assert.equal(quiet(() => V.main([slotSplit, '--strict'])).value, 1);
+});
+
+test('U12 --repair stages under a random name: a link left at the old fixed stage name is never written through', { skip: symlinkSkip }, () => {
+  const good = fixtureFile('stage-good', FIXTURES.good);
+  const out = tmp('stage-out.pptx');
+  const victim = tmp('stage-victim.txt');
+  fs.writeFileSync(victim, 'keep');
+  fs.symlinkSync(victim, `${out}.a4p-tmp`, 'file');
+  quiet(() => V.main([good, '--repair', '--out', out]));
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'keep', 'the file the link leads to is untouched');
+  assert.ok(fs.lstatSync(out).isFile(), 'the output is a regular file');
+  const left = fs.readdirSync(TMP).filter((n) => n.startsWith('stage-out.pptx.') && n !== 'stage-out.pptx.a4p-tmp');
+  assert.deepEqual(left, [], 'no stage file left');
 });
 
 test('U12 the builder maps a schema violation to 3 and a missing pptxgenjs to 2', async () => {
@@ -1524,16 +1725,19 @@ const nodeBuilder = (() => {
   return { ok: false, reason: 'pptxgenjs is not installed. `npm i pptxgenjs`, or set NODE_PATH to a node_modules that has it.' };
 })();
 
+// What makes an interpreter the python builder: build_a4p.py refuses anything before 3.9 (exit 2), so an older
+// python that can import pptx is no builder. U20 keeps this floor and the builder's MIN_PYTHON the same.
+const PY_PROBE = 'import sys; sys.exit(3) if sys.version_info < (3, 9) else None; import pptx; print(pptx.__version__)';
 const pythonBuilder = (() => {
   const candidates = [process.env.A4P_PYTHON, process.env.PYTHON, 'python3', 'python', 'python3.12', 'python3.11', 'python3.10'].filter(Boolean);
   for (const bin of candidates) {
-    const r = spawnSync(bin, ['-c', 'import pptx; print(pptx.__version__)'], { encoding: 'utf8' });
+    const r = spawnSync(bin, ['-c', PY_PROBE], { encoding: 'utf8' });
     if (r.status === 0) return { ok: true, bin, version: (r.stdout || '').trim() };
   }
   return {
     ok: false,
-    reason: `no interpreter among [${candidates.join(', ')}] can import python-pptx. `
-      + 'Set A4P_PYTHON to one that can, or PYTHONPATH to a directory holding python-pptx.',
+    reason: `no interpreter among [${candidates.join(', ')}] is python 3.9 or newer and can import python-pptx. `
+      + 'Set A4P_PYTHON to one that is, or PYTHONPATH to a directory holding python-pptx.',
   };
 })();
 
@@ -1624,7 +1828,7 @@ function normalizePptx(file) {
     .filter((s) => localTag(s.tag) === 'sp')
     .map((s) => ({
       box: { x: s.x, y: s.y, cx: s.cx, cy: s.cy },
-      text: s.paragraphs.map((lines) => lines.map((runs) => runs.map((r) => r.text).join('')).join(' ')).join('\n'),
+      text: s.paragraphs.map((lines) => lines.map((runs) => runs.map((r) => r.text).join('')).join('\u{2028}')).join('\n'),
       slots: s.paragraphs.flatMap((lines) => lines.flatMap((runs) => runs.map((r) => [r.latin, r.ea, r.cs]))),
       body: s.body === null ? null : { wrap: s.body.wrap, autofit: s.body.autofit },
     })));
@@ -1806,4 +2010,35 @@ test('E1b the same substitution that leaves layout() fixed leaves both builders 
 
   // And the builders still agree with layout(), which is the tier-1 statement of the same rule.
   assert.deepEqual(a.slides.map((slide) => slide.map((s) => [s.box.x, s.box.y, s.box.cx, s.box.cy])), coordsOf(B.layout(substituted)));
+});
+
+// Node resolves links for import.meta.url but not for process.argv[1]; comparing the two as given made
+// a run through a linked folder exit 0 without checking anything. The link is a folder junction on
+// Windows, where a file symlink needs admin rights; elsewhere 'junction' is ignored. It sits in a
+// folder of its own, outside TMP, and is removed on its own: no recursive delete ever meets it.
+test('U19 verify_a4p answers the same through a linked folder as through its own path', (t) => {
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a4p-link-'));
+  const link = path.join(linkDir, 'linked');
+  try {
+    fs.symlinkSync(HERE, link, 'junction');
+  } catch {
+    fs.rmdirSync(linkDir);
+    t.skip('links cannot be made here');
+    return;
+  }
+  try {
+    for (const dir of [HERE, link]) {
+      const r = spawnSync(process.execPath, [path.join(dir, 'verify_a4p.mjs')], { encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 3, `${dir}: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`);
+      assert.match(r.stderr, /^usage: verify_a4p\.mjs /m, dir);
+    }
+  } finally {
+    fs.unlinkSync(link);
+    fs.rmdirSync(linkDir);
+  }
+});
+
+test('U20 the python probe takes only what build_a4p.py runs on: python 3.9 or newer', () => {
+  assert.match(fs.readFileSync(BUILD_PY, 'utf8'), /^MIN_PYTHON = \(3, 9\)$/m, 'the builder floor');
+  assert.match(PY_PROBE, /sys\.exit\(3\) if sys\.version_info < \(3, 9\)/, 'the probe floor is the same');
 });

@@ -92,7 +92,7 @@ ts=$(date +%Y%m%d-%H%M%S); cp -r .omc/wiki ".omc/wiki.bak-$ts" && echo "backup: 
 
 - 병합/supersede 매핑(어느 페이지 → 어느 정본), 삭제된 슬러그, 리포인트한 링크.
 - before→after: 페이지 수·총 크기·lint 결과.
-- **백업 위치**(`.omc/wiki.bak-*`)와 "이상 없으면 삭제해도 됨" 안내.
+- **백업 위치**(Claude Code `.omc/wiki.bak-*`, Codex `.omx/wiki.bak-*`, 실제로 만든 경로)와 "이상 없으면 삭제해도 됨" 안내.
 
 ## Output Contract
 

@@ -64,8 +64,26 @@ const MEDIA = /\.(png|jpe?g|webp|gif|mp4|webm|mov)$/i;
 function linkRefusal(dir, fp) {
   let real;
   try { real = fs.realpathSync(fp); } catch { return null; }
+  return realRefusal(dir, real);
+}
+
+function realRefusal(dir, real) {
   if (!real.startsWith(fs.realpathSync(dir) + path.sep)) return '링크가 프로젝트 폴더 밖을 가리켜 보이지 않습니다.';
   return MEDIA.test(real) ? null : '링크가 이미지나 영상이 아닌 파일을 가리켜 보이지 않습니다.';
+}
+
+// What a listed path may be served as: { dev, ino } (BigInt) of the file its links lead to, taken without
+// following a link, so a link put in its place after this check is not that file. null when there is
+// no such file, or its links leave the project or end at a file that is not an image or a video.
+function servedFile(dir, fp) {
+  try {
+    const real = fs.realpathSync(fp);
+    if (realRefusal(dir, real)) return null;
+    const st = fs.lstatSync(real, { bigint: true });
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return null;
+  }
 }
 
 // Why a listed file is neither shown nor served nor hashed, or null when it may be: it must be an
@@ -103,9 +121,11 @@ export function readDecisions(dir) {
 }
 
 // Written whole or not at all: a crash mid-write leaves the previous file.
+// The temp name is random and opened exclusively: a link a repository put at a guessable name is never written through.
 function writeJson(file, value) {
-  fs.writeFileSync(`${file}.tmp`, JSON.stringify(value, null, 2) + '\n');
-  fs.renameSync(`${file}.tmp`, file);
+  const tmp = `${file}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+  try { fs.renameSync(tmp, file); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
 }
 
 const writeDecisions = (dir, all) => writeJson(path.join(dir, DECISIONS), all);
@@ -247,20 +267,26 @@ export function archiveRejected(dir, { now = new Date() } = {}) {
 // path turns into one after the first check).
 const hashes = new Map();
 const notRegular = () => new Error('일반 파일 아님');
+// A file changed within this long of a hash may change again in the same timestamp step (2 s on FAT):
+// its hash is not kept, so the next view reads it again.
+const RACY_MS = 3000n;
+const keyOf = (fp, st) => `${fp}:${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+const racy = (st, startedNs) => startedNs - (st.ctimeNs > st.mtimeNs ? st.ctimeNs : st.mtimeNs) < RACY_MS * 1_000_000n;
 export async function hashFile(fp) {
   if (!(await fs.promises.stat(fp)).isFile()) throw notRegular();
   const fh = await fs.promises.open(fp, READ_FLAGS);
   let done;
   try {
-    const st = await fh.stat();
+    const startedNs = BigInt(Date.now()) * 1_000_000n;
+    const st = await fh.stat({ bigint: true });
     if (!st.isFile()) throw notRegular();
-    const key = `${fp}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+    const key = keyOf(fp, st);
     done = hashes.get(key);
     if (done) return done;
-    done = sha256Of(fh, st.size);
-    done.catch(() => hashes.delete(key));
+    done = sha256Of(fh, Number(st.size));
     hashes.set(key, done);
     await done.catch(() => {});
+    if (racy(st, startedNs) || !(await done.then(() => true, () => false))) hashes.delete(key);
   } finally {
     await fh.close();
   }
@@ -287,7 +313,10 @@ async function hashText(dir, file) {
 
 // The hash text of every listed take by file, four files at a time per call (a long list must not
 // run out of file handles), before the page is drawn.
-async function takeHashes(input, dir) {
+// A take not hashed within waitMs shows that its read goes on; the next view shows its hash.
+const HASH_WAIT_MS = 5000;
+const STILL_READING = '읽는 중(새로 고치면 보임)';
+async function takeHashes(input, dir, waitMs = HASH_WAIT_MS) {
   const files = [...new Set(input.scenes.flatMap((s) => s.takes.map((t) => t.file)))];
   const out = new Map();
   let next = 0;
@@ -297,8 +326,12 @@ async function takeHashes(input, dir) {
       out.set(f, await hashText(dir, f));
     }
   };
-  await Promise.all(Array.from({ length: Math.min(4, files.length) }, worker));
-  return out;
+  const all = Promise.all(Array.from({ length: Math.min(4, files.length) }, worker));
+  let timer;
+  const late = new Promise((resolve) => { timer = setTimeout(resolve, waitMs); });
+  await Promise.race([all, late]);
+  clearTimeout(timer);
+  return new Map(files.map((f) => [f, out.has(f) ? out.get(f) : STILL_READING]));
 }
 
 function media(t, dir) {
@@ -366,11 +399,11 @@ function summary(input, entries) {
 }
 
 /** The review page for `input`. Resolves once every listed take is hashed. */
-export async function renderPage(input, decisions, { dir }) {
+export async function renderPage(input, decisions, { dir, hashWaitMs }) {
   const stage = decisions[input.stage] || { scenes: [] };
   const entries = new Map(stage.scenes.map((e) => [e.id, { ...e, rejected: e.rejected || [] }]));
   const promptLabel = input.promptLabel || (INSTRUCTION_STAGES.has(input.stage) ? '구성 지시문' : '프롬프트');
-  const ctx = { dir, promptLabel, entries, hashes: await takeHashes(input, dir) };
+  const ctx = { dir, promptLabel, entries, hashes: await takeHashes(input, dir, hashWaitMs) };
   const body = input.scenes.map((s, i) => sceneBlock(s, i, ctx)).join('\n') || '<p class="empty">curate-input.json 에 장면이 없습니다.</p>';
   return `<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -505,8 +538,9 @@ async function page(dir, res) {
 function serveListed(dir, req, res, urlPath) {
   const fp = resolveInside(dir, urlPath);
   if (!fp) return send(res, 403, '403');
-  if (!listedFiles(dir).has(fp) || linkRefusal(dir, fp)) return send(res, 404, '404');
-  sendFile(req, res, fp);
+  const expect = listedFiles(dir).has(fp) ? servedFile(dir, fp) : null;
+  if (!expect) return send(res, 404, '404');
+  sendFile(req, res, fp, {}, { expect });
 }
 
 function route(dir, req, res, urlPath) {
@@ -546,7 +580,7 @@ export async function startCurate(dir, { port, host = process.env.PREVIEW_HOST |
 // Starts hashing the listed takes, so the first view of the page does not wait for a large render.
 // An input that cannot be read hashes nothing here; the page reports it.
 function warmHashes(dir) {
-  try { return takeHashes(readInput(dir), dir).catch(() => new Map()); } catch { return Promise.resolve(new Map()); }
+  try { return takeHashes(readInput(dir), dir, 2 ** 31 - 1).catch(() => new Map()); } catch { return Promise.resolve(new Map()); }
 }
 
 // ---- CLI ------------------------------------------------------------------------
@@ -601,7 +635,15 @@ async function main() {
   return serveMain(dir, o);
 }
 
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) {
+// Node resolves links for import.meta.url but not for process.argv[1], so both go through realpath:
+// compared as given, a run through a linked folder would exit 0 without doing anything.
+const invokedDirectly = () => {
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+if (invokedDirectly()) {
   main().catch((e) => { console.error(String(e?.message || e)); process.exit(1); });
 }

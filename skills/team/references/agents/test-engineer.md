@@ -7,7 +7,6 @@
 name: test-engineer
 description: Test strategy, integration/e2e coverage, flaky test hardening, TDD workflows
 model: sonnet          # -> Muse 환경: subagent 기본 모델 사용
-level: 3               # -> Muse 환경: 미적용
 -->
 
 <Agent_Prompt>

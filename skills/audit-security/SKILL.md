@@ -18,11 +18,11 @@ description: "(banker) 의존성 CVE(SCA)·SAST·시크릿을 멀티툴 교차�
 - 이전 세션/에이전트의 "취약점 없음" 주장을 **직접 재검증**할 때
 
 ## 불변 원칙
-1. **read-only**: 소스·`pom.xml`/`package.json`/`requirements.txt`/CI **일절 무변경**. 도구·러너·결과는 작업용 디렉터리(예: gitignored `.audit/` 또는 작업 디렉터리)에 격리. 도구는 advisory DB만 조회(소스 미수정)
-2. **시크릿 값 비노출**: 리포트·로그에 **secret value 절대 미기입**. `RuleID + file:LINE`만. 값 확인이 필요하면 사용자에게 "해당 file:LINE 직접 확인" 안내(cat/grep로 값 출력 금지)
-3. **local-first + 온라인 교차검증**: advisory DB는 로컬/공개(OSV·deps.dev·trivy-db)를 1차로, 온라인은 recall 보강용 교차검증만. **active-verify 금지** — 시크릿을 **실 엔드포인트에 인증 시도**하는 egress는 금지(특히 규제·민감 환경에선 절대 불가)
-4. **verify-before-claim**: 모든 finding은 `CVE-ID`/`RuleID` + `file:LINE` 동반. "0건 = 안전 보증" **금지**(semgrep CE는 intraprocedural — 함수 경계 taint 미추적; parse 실패 파일 = 미커버). 완료 전 4-field(① 변경 ② Evidence ③ 검증 ④ Unknown), ⏳=0일 때만 "완료"
-5. **remediation은 사용자 게이트**: 의존성 version bump(`pom.xml`/`package.json`/`requirements.txt` 편집)·secret rotate는 **기능 리스크 있는 실변경 → 자율 X, 사용자 confirm**. 스캔·재빌드-검증은 자율 OK이나 **버전 편집 자체는 게이트**
+1. **read-only**: 소스·`pom.xml`/`package.json`/`requirements.txt`/CI **일절 무변경**. 도구·러너·결과는 감사 대상 저장소 밖의 작업 폴더(`$RESEARCH_DIR`, 없으면 `mktemp -d` 로 만든 개인 폴더)에 격리. 저장소 안의 폴더(예: `.audit/`)는 쓰지 않는다. 저장소가 그 자리에 링크를 심어 두면 결과 쓰기가 링크 너머 파일을 덮는다. 만든 폴더의 경로는 리포트 Evidence 에 적는다. 다시 돌릴 러너와 결과를 오래 두려면 `RESEARCH_DIR` 로 저장소 밖 폴더를 준다(`/tmp` 는 OS 가 비울 수 있다). 도구는 advisory DB만 조회(소스 미수정).
+2. **시크릿 값 비노출**: 리포트·로그에 **secret value 절대 미기입**. `RuleID + file:LINE`만. 값 확인이 필요하면 사용자에게 "해당 file:LINE 직접 확인" 안내(cat/grep로 값 출력 금지).
+3. **local-first + 온라인 교차검증**: advisory DB는 로컬/공개(OSV·deps.dev·trivy-db)를 1차로, 온라인은 recall 보강용 교차검증만. **active-verify 금지** — 시크릿을 **실 엔드포인트에 인증 시도**하는 egress는 금지(특히 규제·민감 환경에선 절대 불가).
+4. **verify-before-claim**: 모든 finding은 `CVE-ID`/`RuleID` + `file:LINE` 동반. "0건 = 안전 보증" **금지**(semgrep CE는 intraprocedural — 함수 경계 taint 미추적; parse 실패 파일 = 미커버). 완료 전 4-field(① 변경 ② Evidence ③ 검증 ④ Unknown), ⏳=0일 때만 "완료".
+5. **remediation은 사용자 게이트**: 의존성 version bump(`pom.xml`/`package.json`/`requirements.txt` 편집)·secret rotate는 **기능 리스크 있는 실변경 → 자율 X, 사용자 confirm**. 스캔·재빌드-검증은 자율 OK이나 **버전 편집 자체는 게이트**.
 
 ## Workflow
 
@@ -30,6 +30,39 @@ description: "(banker) 의존성 CVE(SCA)·SAST·시크릿을 멀티툴 교차�
 - **스킬 진입 시 항상 먼저 실행. 무조건 재설치 절대 금지 — 있으면 skip, 없는 것만 설치:**
 - 각 도구 `command -v` 검사(semgrep은 venv path `-x`) → **누락분만** 설치: Go 도구는 GitHub release asset 다운로드(`~/.local/bin`), pip 도구는 `pip install --user`, semgrep은 격리 venv
 - 멱등 setup 러너로 감싸면 재진입이 빠름(전부 있으면 network 0). exit 0=준비됨, exit 1=누락 잔존
+
+#### 네트워크 확인 (내려받기 전)
+
+누락분을 받기 전에 그 원천에 10초 안에 닿는지 본다. 닿지 않으면 받지 않고 "오프라인이라 설치하지 않음(필요한 것: <도구>)" 으로 적는다. 그 도구가 맡은 축은 2단계의 "결과로 읽는 조건" 대로 미커버다.
+
+```bash
+[ "${CODEX_SANDBOX_NETWORK_DISABLED:-}" = 1 ] && echo "Codex sandbox 가 네트워크를 막음(아래 실패는 오프라인이 아님)"
+curl --ssl-no-revoke -sSI -o /dev/null --connect-timeout 5 --max-time 10 https://github.com   # Go 도구(release asset)
+# pip 이 읽는 설정 전부(PIP_CONFIG_FILE 포함)를 홈 폴더에서 읽는다. install 절이 global 절보다 앞선다
+L=$( (cd ~ && { pip config list || pip3 config list || python3.13 -m pip config list || python3.12 -m pip config list || python3.11 -m pip config list || python3 -m pip config list; }) 2>/dev/null) || echo "pip 설정을 읽지 못함(pip 이 없거나 10 미만). 사내 미러를 쓰면 확인 주소를 그 미러로 바꿔 본다"
+I="${PIP_INDEX_URL:-$(printf '%s\n' "$L" | sed -n "s/^install\.index-url='\(.*\)'$/\1/p")}"
+I="${I:-$(printf '%s\n' "$L" | sed -n "s/^global\.index-url='\(.*\)'$/\1/p")}"
+I=$(printf %s "${I:-https://pypi.org/simple}" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#; s#/$##')   # 주소의 사용자 정보는 뗌
+printf 'url = "%s"\n' "$I/pip/" | curl --ssl-no-revoke -K - -sSI -o /dev/null --connect-timeout 5 --max-time 10   # pip 도구(pip-audit, detect-secrets), semgrep venv
+```
+
+- `curl -sSI` 는 머리만 받는다(본문을 받지 않음). 닿지 못하면 종료 코드가 0 이 아니다(HTTP 상태와 관계없음). `curl` 은 `HTTPS_PROXY` 를 따른다. 확인 줄은 `--ssl-no-revoke` 를 준다. Windows 의 Git Bash curl 도 Schannel 이라, 폐지 목록 서버에 닿지 못하는 망에서 폐지 확인이 실패하면 종료 60 이다(Windows 박스 실측). 다른 curl 은 이 깃발을 받고 무시한다(macOS curl 8.7.1, Rocky 8.10 curl 7.61.1 실측).
+- PyPI 는 pip 이 쓰는 색인(`PIP_INDEX_URL`, `pip config list` 의 `install.index-url` 이나 `global.index-url`, 없으면 pypi.org)의 작은 쪽(`<색인>/pip/`)을 본다.
+- `pip config get` 은 `PIP_CONFIG_FILE` 로 준 파일을 읽지 않아(pip 25.0 실측) `pip config list` 를 읽는다.
+- Rocky 8 의 기본 pip(9.0.3, `pip3`)은 `config` 명령이 없고 `pip` 이름은 없다(Rocky 8.10 실측). 그래서 판 붙은 python(3.13, 3.12, 3.11)의 pip 도 차례로 본다.
+- 홈 폴더에서 읽는다. `python3 -m pip` 는 지금 폴더를 import 경로 맨 앞에 두어, 지금 폴더에 있는 남의 저장소의 `pip/` 가 실행될 수 있다.
+- bash 블록은 주소를 명령 인자가 아니라 표준 입력의 curl 설정(`-K -`)으로 넘긴다. 명령 인자는 같은 PC 의 다른 사용자가 `ps` 로 볼 수 있어, 경로나 질의에 든 토큰도 거기 싣지 않는다. 사용자 정보(`사용자:토큰@`)는 떼고 묻는다. 닿는지만 보므로 인증은 필요 없다(401 도 닿은 것이다). Windows 에서도 뗀 주소를 쓴다.
+- 사내 미러만 열린 망이면 확인 주소를 그 미러로 바꿔 본다.
+- Codex sandbox 가 네트워크를 막는 모드(기본 `workspace-write`, `read-only`)에서는 `CODEX_SANDBOX_NETWORK_DISABLED=1` 이 서고 확인이 모두 실패한다(curl 종료 7, npm `EPERM`). 블록의 첫 줄이 그렇다고 알린다. 그때는 '오프라인' 이 아니라 'sandbox 가 네트워크를 막음' 으로 보고하고, 승인을 받아 sandbox 밖에서 확인부터 다시 한다. Claude Code sandbox 안(`SANDBOX_RUNTIME=1`)에서는 허용 목록 밖 주소를 sandbox 프록시가 막는다. Windows PowerShell 에서는 `$env:CODEX_SANDBOX_NETWORK_DISABLED -eq '1'` 로 본다.
+- 확인이 실패하면 보고에 그 명령, 종료 코드, stderr 첫 줄을 붙인다(예: `npm error code ETIMEDOUT`, `curl: (28) ...`). 원인을 '오프라인' 하나로 짐작하지 않는다.
+- curl 의 종료 60(인증서 검증 실패)도 오프라인이 아니다. 망은 열려 있고, TLS 를 가로채는 사내 프록시의 인증서를 OS 가 믿지 않는 것이다. '인증서 문제로 설치하지 않음' 으로 보고한다.
+
+Go 도구의 release asset 은 새 임시 폴더에 받아 풀고, 그 폴더는 끝나면 지운다(받다 끊긴 파일이 실행 파일 이름으로 남지 않는다). 받는 속도가 초당 1000바이트 밑으로 30초 이어지면 끊는다. https 만 받는다(되돌림 주소도 https 만). 받은 파일의 체크섬은 그 release 의 체크섬 파일과 사람이 견준다(이 블록은 견주지 않는다).
+
+```bash
+T=$(mktemp -d) && curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 10 --speed-limit 1000 --speed-time 30 -o "$T/<asset>" "https://github.com/<저장소>/releases/download/<판>/<asset>" \
+  && tar -xzf "$T/<asset>" -C "$T" && mkdir -p ~/.local/bin && mv "$T/<실행 파일>" ~/.local/bin/; [ -n "$T" ] && rm -rf "$T"
+```
 
 ### 도구 (예시 조합 — 검증된 stack, 대상 박스에 맞게)
 | 도구 | 위치 | 설치 방식 |
@@ -42,9 +75,9 @@ description: "(banker) 의존성 CVE(SCA)·SAST·시크릿을 멀티툴 교차�
 | **detect-secrets** | pip --user | `pip install --user` |
 | **semgrep** | 격리 venv(`$(command -v semgrep)`) | 버전 핀 venv |
 
-- ⚠️ **오래된 glibc 환경**(예: RHEL8 glibc 2.28): Go 정적 바이너리(osv/trivy/grype/gitleaks)는 glibc 무관해 `~/.local/bin`에 두면 그대로 동작. Python wheel·ast-grep CLI는 glibc 2.29+ 요구로 실패할 수 있음 → semgrep은 **glibc 핀 venv**로 격리
-- ⚠️ **`set -u` 주의**: 일부 쉘 init이 `$ZSH_VERSION` 등 unbound 변수를 참조해 `set -u`가 command-substitution 서브셸을 깨뜨릴 수 있음(다운로드 URL이 빈 문자열이 됨). 러너는 `set -o pipefail`만 권장
-- ⚠️ **exit code 1 = 정상**(스캔 한정): osv/grype/gitleaks/npm audit는 "findings present"를 rc=1로 반환 — 에러 아님. (단 setup 러너의 exit 1은 "도구 미설치 잔존"으로 다름)
+- ⚠️ **오래된 glibc 환경**(예: RHEL8 glibc 2.28): Go 정적 바이너리(osv/trivy/grype/gitleaks)는 glibc 무관해 `~/.local/bin`에 두면 그대로 동작. Python wheel·ast-grep CLI는 glibc 2.29+ 요구로 실패할 수 있음 → semgrep은 **glibc 핀 venv**로 격리.
+- ⚠️ **`set -u` 주의**: 일부 쉘 init이 `$ZSH_VERSION` 등 unbound 변수를 참조해 `set -u`가 command-substitution 서브셸을 깨뜨릴 수 있음(다운로드 URL이 빈 문자열이 됨). 러너는 `set -o pipefail`만 권장.
+- ⚠️ **exit code 1 = 정상**(스캔 한정): osv/grype/gitleaks/npm audit는 "findings present"를 rc=1로 반환 — 에러 아님. (단 setup 러너의 exit 1은 "도구 미설치 잔존"으로 다름.) 그래도 결과로 읽기 전에 아래 "결과로 읽는 조건" 을 먼저 본다. 네트워크가 없으면 npm audit 도 rc 1 이지만 본문은 오류뿐이다.
 
 ### 2단계 — 스캔 (멱등, 전 서브앱)
 도구는 소스/`pom.xml`/`package.json`/CI 무변경. 3 카테고리:
@@ -58,7 +91,36 @@ description: "(banker) 의존성 CVE(SCA)·SAST·시크릿을 멀티툴 교차�
 | **npm audit** | `(cd <frontend> && npm audit --json)` | `package-lock.json` | npm registry advisory |
 | **pip-audit** | `-r <requirements>.txt` | (PyPI+OSV) | ⚠️ 일부 env에서 실패 가능 → Python은 osv로 커버 |
 
-#### SAST (소스 정적) — semgrep CE
+#### 결과로 읽는 조건 (네트워크 없음과 0건을 가른다)
+SCA 도구는 advisory DB 나 레지스트리를 네트워크에서 받는다. 네트워크가 없으면 결과 JSON 을 그대로 셀 때 0건이 된다.
+실측(osv-scanner 2.4.0, npm 11, 네트워크 없음):
+- 오프라인 `npm audit --json` 은 rc 1 이고, 본문은 `message` 와 `error` 뿐이다.
+- `osv-scanner scan source` 는 20초 뒤 rc 127 이고, stdout 이 빈다.
+- `--offline-vulnerabilities` 에 로컬 DB 가 없으면 rc 127 과 `{"results": []}` 이다.
+- 로컬 DB 가 비어 있으면 rc 0 과 `{"results": []}` 다. 문제없음과 모양이 같다.
+- 패키지 소스가 없으면 rc 128 이다. 네트워크가 아니라 대상이 없는 것이다.
+
+도구마다 stdout 은 `$OUT/<도구>.json`, stderr 는 `$OUT/<도구>.err` 로 따로 남기고 종료 코드를 적는다. `OUT` 은 1번 규칙의 작업 폴더다(`OUT="${RESEARCH_DIR:-$(mktemp -d)}"; mkdir -p "$OUT"`). 비어 있으면 `/<도구>.json` 에 쓰게 되므로 먼저 정한다. 아래 조건은 이 셋으로 본다. 조건을 모두 채워야 결과로 읽는다.
+
+| 도구 | 결과로 읽는 조건 | 실측 |
+|---|---|---|
+| npm audit | 종료 코드 0 이나 1. 본문이 JSON 이고 `error` 키가 없음. `metadata.dependencies.total` 이 0 보다 큼 | 실측 |
+| osv-scanner | 종료 코드 0 이나 1. 본문이 JSON. stderr 의 `Scanned <파일> file and found <N> package` 의 N 합이 0 보다 큼 | 실측 |
+| osv-scanner 오프라인 DB | 위 조건에 더해, stderr 의 `Loaded <생태계> local db from <경로>` 가 가리키는 파일이 항목을 1개 이상 가짐 | 실측 |
+| trivy | 종료 코드 0. 본문이 JSON 이고 `Results` 가 1개 이상 | 미실측 |
+| grype | 종료 코드 0 이나 1. 본문이 JSON 이고 `matches` 키가 있음. stderr 에 DB 오류가 없음 | 미실측 |
+| semgrep | 종료 코드 0 이나 1. 본문이 JSON 이고 `paths.scanned` 가 1개 이상. `errors` 에 규칙 내려받기 실패가 없음 | 미실측 |
+| pip-audit | 종료 코드 0 이나 1. 본문이 JSON 이고 `dependencies` 가 1개 이상 | 미실측 |
+
+- 조건을 하나라도 못 채운 도구는 0건으로 세지 않는다. 리포트 Unknown 에 "미커버(네트워크 없음 또는 대상 없음): <도구>, 종료 <코드>, <stderr 첫 줄>" 로 적는다.
+- 이유를 짐작해 하나로 정하지 않는다. osv-scanner 의 128 은 패키지 소스 없음이고, npm audit 의 `ENOLOCK` 은 잠금 파일 없음이다.
+- 미실측 행은 이 머신에 도구가 없어 출력 모양을 재지 못한 조건이다. 실제 출력이 조건과 달라 판단이 서지 않으면 미커버로 적는다.
+- 오프라인 DB 로 돌렸으면 DB 의 기준일(파일 수정 시각)을 Evidence 에 적는다. 그 뒤에 나온 advisory 는 Unknown 에 미커버로 적는다.
+- 한 축의 도구가 모두 미커버면 그 축 전체를 미커버로 적는다.
+- Secrets 축(gitleaks, detect-secrets)은 로컬이라 네트워크와 관계없다.
+- 오프라인에서 돌리는 길: osv-scanner `--offline-vulnerabilities`(미리 받은 DB), trivy `--skip-db-update --offline-scan`(DB 사본), grype `GRYPE_DB_AUTO_UPDATE=false`(가져온 DB), semgrep 은 로컬 규칙 파일(`--config <파일>`). 판마다 이름이 다를 수 있어 `--help` 로 확인한다.
+
+### SAST (소스 정적) — semgrep CE
 ```
 semgrep scan --config p/security-audit --config p/owasp-top-ten \
   --config p/java --config p/python --config p/typescript --config p/javascript \

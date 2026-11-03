@@ -1,7 +1,7 @@
 ---
 name: all-in-one
-description: "(banker) 한 요청으로 합의 계획→검증 구현→독립 테스트 게이트를 연쇄(계획→구현→QA). 코딩 작업을 계획부터 통과까지 최대 rigor로 한 번에. 사용자가 'all-in-one 해줘'/'all in one'이라고 요청하면 사용(한 줄 수정은 직접 처리, 아이디어 확장은 제외)."
-argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests|build|lint|typecheck] [--no-deslop] <task description>"
+description: "(banker) 한 요청으로 합의 계획→검증 구현→독립 테스트 게이트(ralph-qa 독립 검토)를 연쇄(계획→구현→QA). 코딩 작업을 계획부터 통과까지 최대 rigor로 한 번에. 사용자가 'all-in-one 해줘'/'all in one'이라고 요청하면 사용(한 줄 수정은 직접 처리, 아이디어 확장은 제외)."
+argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests|build|lint|typecheck|scenarios] [--no-deslop] <task description>"
 ---
 
 # all-in-one — Plan → Implement → QA, one command
@@ -34,7 +34,7 @@ argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests
 | `--short` | Stage 1이 pre-mortem + 확장 테스트 계획 없이 짧게(저위험 작업용) | off → 정식 합의 |
 | `--checkpoint` | Stage 1(계획)과 Stage 2(구현) 사이에 사용자 승인 게이트 삽입 | off → 자동 진행 |
 | `--critic=critic\|architect` | Stage 2 검증에 넘길 리뷰어 | `critic` |
-| `--qa=tests\|build\|lint\|typecheck` | Stage 3의 QA 목표 | `tests` |
+| `--qa=tests\|build\|lint\|typecheck\|scenarios` | Stage 3의 QA 목표(0.25.0부터 scenarios 추가) | `tests` |
 | `--no-deslop` | Stage 2에 전달(리뷰 후 정리 패스 생략) | off |
 
 플래그가 아닌 나머지 전체가 `<task description>`.
@@ -43,7 +43,7 @@ argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests
 
 ### Stage 0 — 전제 확인
 - Stage 1의 `ralplan` 스킬, Stage 2의 `ralph` 스킬이 workspace 스킬로 연결되어 있는지 확인(둘 다 이식됨). 없으면 해당 단계를 서브에이전트 에뮬레이션으로 대체
-- 원본의 OMC(oh-my-claudecode) `ultraqa` 스킬은 이 환경에 이식되지 않음 → **Stage 3은 `subagent.spawn` 독립 QA 에이전트로 에뮬레이션**(아래 Stage 3 참조)
+- 업스트림 0.25.0부터 Stage 3 게이트는 `ralph-qa`다. 이 환경에는 이식된 `ralph-qa` 스킬이 있으므로 **Stage 3은 `ralph-qa`를 정식 경로로** 쓰고, 없으면 `subagent.spawn` 독립 QA 에이전트로 에뮬레이션(아래 Stage 3 참조)
 
 ### Stage 1 — Plan: `ralplan` 스킬
 - 이식된 `ralplan` 스킬을 호출: `--deliberate <task description>`(`--short`가 있으면 `--deliberate` 생략)
@@ -65,9 +65,9 @@ argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests
 - **Stage 3 시작 전에 Stage 2 ralph가 완전히 종료되어야 함**(구현과 QA의 작업 상태가 겹치면 안 됨)
 - **근본적 블로커 보고 시**(3회 이상 반복되는 동일 이슈, 크레덴셜 누락, 불명확한 요구사항, 외부 의존성 다운): 중단하고 보고. 깨진/부분 빌드에 Stage 3을 돌리고 완료라 부르지 말 것
 
-### Stage 3 — QA gate: 독립 테스트 (ultraqa 미이식 → 에뮬레이션)
+### Stage 3 — QA gate: 독립 테스트 (ralph-qa)
 - 전제: Stage 2 ralph 완전 종료(작업 상태 겹침 없음)
-- `ultraqa` 스킬은 이 환경에 없음 → `subagent.spawn`으로 **새로운 독립** QA 에이전트 실행(빌드한 주체와 다른 에이전트). 목표 = `--qa` 플래그(기본 `--tests`)
+- 이식된 `ralph-qa` 스킬을 정식 경로로 쓴다(독립 검토자 3명 이상 + 실행기 게이트 증거). `ralph-qa`가 없으면 `subagent.spawn`으로 **새로운 독립** QA 에이전트 실행(빌드한 주체와 다른 에이전트). 목표 = `--qa` 플래그(기본 `--tests`)
 - QA 사이클(최대 5회):
   1. **검증** — 새로운 독립 QA 에이전트가 `--qa` 목표를 실행해 PASS/FAIL + 명령·출력·실패 항목 보고. 실패가 기존 것인지의 판단은 눈대중이 아니라 **베이스라인 기록으로** — 베이스라인에 없는 실패는 새 실패다.
   2. **PASS** → 게이트 통과, 최종 보고로.
@@ -99,6 +99,7 @@ argument-hint: "[--short] [--checkpoint] [--critic=critic|architect] [--qa=tests
 ## Operating Rules
 - **서브에이전트 위임**: Claude Code의 Task tool 자리는 이 환경의 `subagent.spawn`으로 대체. 각 단계는 독립 실행 단위로, 리뷰어(Critic·QA)는 작성자(Planner·Builder)와 다른 주체로(anti-self-approval 유지)
 - **Stage 1·2는 이식된 `ralplan`/`ralph` 스킬을 정식 경로로 사용**(이미 workspace에 이식됨). 이 두 스킬이 없으면 해당 단계를 서브에이전트로 에뮬레이션
-- **Stage 3의 `ultraqa`는 미이식** → `subagent.spawn` 독립 QA 에이전트 에뮬레이션이 가장 가까운 대안. 나중에 ultraqa 동등 스킬이 연결되면 그때부터 우선 사용
+- **Stage 3은 이식된 `ralph-qa`를 정식 경로로 사용**. `ralph-qa`가 없으면 `subagent.spawn` 독립 QA 에이전트 에뮬레이션이 대안
 - `--critic`의 `codex` 옵션은 Codex 런타임 전용이라 제외(`critic`|`architect`만)
+- `--codex`/`--gemini`/`--opencode` 같은 외부 모델 패스스루는 이 환경에 해당 CLI가 없으므로, 외부 모델 관점이 필요하면 서브에이전트 병렬 검토로 대체한다
 - 플래그 해석: `--short`(Stage 1 간소화), `--checkpoint`(Stage 1→2 사이 승인), `--critic`(Stage 2 리뷰어), `--qa`(Stage 3 목표), `--no-deslop`(Stage 2 정리 패스 생략)

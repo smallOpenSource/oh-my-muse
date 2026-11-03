@@ -7,7 +7,6 @@
 name: tracer
 description: Evidence-driven causal tracing with competing hypotheses, evidence for/against, uncertainty tracking, and next-probe recommendations
 model: sonnet          # -> Muse 환경: subagent 기본 모델 사용
-level: 3               # -> Muse 환경: 미적용
 -->
 
 <Agent_Prompt>

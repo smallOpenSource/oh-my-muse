@@ -85,7 +85,7 @@ node obsidize.mjs <vault-path> [--profile=auto|omc|generic] [--dry-run] [--json]
 - **기본 = dry-run.** `--apply` 전까지 아무것도 쓰지 않는다. 미리보기 없는 자동 변형은 금지.
 - **결정성 주장의 범위**: 바이트 멱등은 **캐노니컬라이저에만** 귀속. 의미 판단(링크·dedup 선택)은 실행마다 달라질 수 있어 **Unknown**으로 보고하며 절대 바이트로 단언하지 않는다.
 - **타임스탬프 무잡음**: `created`는 절대 안 건드림. `updated`는 직렬화된 내용이 실제로 바뀔 때만(바이트 diff 게이트) 갱신.
-- **모든 쓰기는 원자적**: 유니크 temp + 배타 생성 + fsync + rename. 절대 in-place bare write가 아니다. read-back CAS는 lost update 창을 `rename` 한 번으로 줄일 뿐 없애지 못한다 — 이 잔여 race는 **수용**이다.
+- **모든 쓰기는 원자적**: 유니크 temp + 배타 생성 + fsync(파일 시스템이 받으면. EINVAL, ENOTSUP이면 건너뜀) + rename. 절대 in-place bare write가 아니다. read-back CAS는 lost update 창을 `rename` 한 번으로 줄일 뿐 없애지 못한다 — 이 잔여 race는 **수용**이다.
 - **해소 가능한 bare-form 링크는 삭제하지 않는다**(예외: (1) 대상 파일이 없는 broken-ref, (2) OMC 프로파일에서 bare slug가 아닌 형태). 푸터를 다시 그리기 전에 본문의 해소 가능한 위키링크를 `links[]`에 합집합으로 흡수한다 — 이 흡수가 없으면 수기 푸터 링크가 조용히 사라진다.
 - **`links[]` 항목은 어느 경로에서도 지우지 않는다**(정렬·dedup만). 본문은 재작성하지 않는다(추가·포맷만).
 - **`%%obsidizer:ignore%%` 옵트아웃**: 파일 어디든 이 마커가 있으면 프로파일 무관하게 그 페이지를 통째로 건너뛴다(리포트에 `ignored`로 집계). 건너뛴 페이지도 vault 모델에는 남는다.

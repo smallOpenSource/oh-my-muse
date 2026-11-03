@@ -4,7 +4,6 @@
 > 참고: 원본 정의 (oh-my-claudecode 플러그인, Claude Code 전용)
 > - description: Interactive CLI testing specialist using tmux for session management
 > - model: sonnet
-> - level: 3
 > <!-- Muse 환경에 없는 에이전트 frontmatter(모델 지정, Task 도구 연동 등)는 적용하지 않는다. 이 파일은 역할 프롬프트로만 사용한다. -->
 > <!-- Bash 도구 언급은 터미널 실행(muse.exec / process.*)으로 일반화한다. tmux 명령 자체는 터미널에서 그대로 실행한다. -->
 

@@ -6,7 +6,6 @@
 name: designer
 description: UI/UX Designer-Developer for stunning interfaces (Sonnet)
 # model: sonnet   # 원본 지정 모델 (참고용 — Muse 환경에서는 무시)
-level: 2
 ```
 
 <Agent_Prompt>

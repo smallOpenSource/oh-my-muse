@@ -18,6 +18,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -330,10 +332,14 @@ test("the cache's temp file is created fresh, never written through a link plant
   mkdirSync(t.cache, { mode: 0o700 });
   const victim = join(dirname(t.cache), "victim.txt");
   writeFileSync(victim, "keep me");
-  symlinkSync(victim, `${cachePath(t.cache, t.path)}.${process.pid}.tmp`);
+  // the old guessable name (<cache>.<pid>.tmp): the temp name is random now, so a link there is never opened
+  const planted = `${cachePath(t.cache, t.path)}.${process.pid}.tmp`;
+  symlinkSync(victim, planted);
   assert.equal(estimatePayloadBytes(t.path, t.cache), sum(a));
   assert.equal(readFileSync(victim, "utf8"), "keep me");
   assert.ok(lstatSync(cachePath(t.cache, t.path)).isFile(), "the cache itself is a regular file");
+  assert.ok(lstatSync(planted).isSymbolicLink(), "the planted link is left as it was");
+  rmSync(planted);
   assert.equal(readCache(t.cache).state.bytes, sum(a));
 });
 
@@ -350,4 +356,37 @@ test("clearCache deletes a cache folder this account controls and leaves any oth
   writeFileSync(join(shared, "theirs.json"), "{}");
   clearCache(shared);
   assert.ok(existsSync(join(shared, "theirs.json")));
+});
+
+// Deferred 18: every file number made to pass 2^53, as NTFS file IDs do (seen on the Windows test box): the
+// numbers stay apart as BigInt and all read as one Number.
+function withHighFileIds(fn) {
+  const real = fs.fstatSync;
+  const ids = new Map();
+  fs.fstatSync = function (fd, opts) {
+    const st = real.call(this, fd, opts);
+    const key = `${st.dev}:${st.ino}`;
+    if (!ids.has(key)) ids.set(key, (1n << 60n) + BigInt(ids.size + 1));
+    st.ino = opts?.bigint ? ids.get(key) : Number(ids.get(key));
+    return st;
+  };
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fs.fstatSync = real;
+    syncBuiltinESMExports();
+  }
+}
+
+test("a transcript replaced by a file whose number differs only past 2^53 is rescanned", () => {
+  withHighFileIds(() => {
+    const t = transcript([user("old")]);
+    estimatePayloadBytes(t.path, t.cache);
+    const y = user("y".repeat(100));
+    const z = user("z".repeat(100));
+    writeFileSync(t.path + ".new", jsonl([y, z]));
+    renameSync(t.path + ".new", t.path);
+    assert.equal(estimatePayloadBytes(t.path, t.cache), sum(y, z));
+  });
 });

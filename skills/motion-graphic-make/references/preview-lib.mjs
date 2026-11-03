@@ -16,11 +16,13 @@
  *
  * Runtime: Node >=18 builtins only (node:fs / node:http / node:net / node:path). No shell.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
-import { pipeline } from 'node:stream';
+import { Transform, pipeline } from 'node:stream';
 
 export const LOOPBACK = '127.0.0.1';
 // Answers { pid } so a stop can tell this server from another process on the same port.
@@ -38,6 +40,8 @@ export const MIME = {
   '.mjs': 'text/javascript;charset=utf-8', '.json': 'application/json;charset=utf-8', '.png': 'image/png',
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml',
   '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.woff2': 'font/woff2',
+  // Notes and logs a report links to open as text in the browser instead of downloading.
+  '.md': 'text/plain;charset=utf-8', '.txt': 'text/plain;charset=utf-8', '.log': 'text/plain;charset=utf-8', '.jsonl': 'text/plain;charset=utf-8',
 };
 
 // `strict` is the policy above; any other text is a policy as written; nothing means no header.
@@ -78,39 +82,57 @@ export function send(res, status, body, headers = {}) {
 export const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0);
 
 // An open regular file: { fd, size }, or { status } when there is none (404) or it cannot be read (403).
-function openRegular(fp) {
+// With `expect` ({ dev, ino } of the file a check passed, as BigInt), another file at the path is none:
+// the path changed between that check and this open. BigInt, since an NTFS file id is 64 bits and a
+// Number keeps only 53: two files could read as one.
+function openRegular(fp, expect) {
   let fd;
   try { fd = fs.openSync(fp, READ_FLAGS); } catch (e) { return { status: ['ENOENT', 'ENOTDIR', 'EISDIR'].includes(e.code) ? 404 : 403 }; }
   let st = null;
-  try { st = fs.fstatSync(fd); } catch { /* a status the system cannot give (EIO on a network drive) */ }
-  if (st && st.isFile()) return { fd, size: st.size };
+  try { st = fs.fstatSync(fd, { bigint: true }); } catch { /* a status the system cannot give (EIO on a network drive) */ }
+  if (st && st.isFile() && sameFile(st, expect)) return { fd, size: Number(st.size) };
   fs.closeSync(fd);
   return { status: st ? 404 : 403 };
 }
 
+const sameFile = (st, expect) => !expect || (st.dev === expect.dev && st.ino === expect.ino);
+
 // Sends the bytes `start`..`end` of an open file (what the headers declared, even if the file grows
 // meanwhile) and closes it, also when the browser drops the download midway (a pipe would keep the
 // file open). Nothing to send closes the file and ends the response.
-function stream(res, fp, { fd, start, end }) {
-  if (end < start) {
+// A HEAD request gets the headers only: the file is closed unread.
+function stream(res, fp, { fd, start, end, head }) {
+  if (head || end < start) {
     fs.closeSync(fd);
     return void res.end();
   }
-  pipeline(fs.createReadStream(fp, { fd, start, end }), res, () => {});
+  pipeline(fs.createReadStream(fp, { fd, start, end }), declaredLength(end - start + 1), res, () => {});
+}
+
+// Passes the bytes on and fails at the end when they were fewer than the headers declared (the file
+// shrank since): the pipeline then destroys the response, which closes the connection. Ended as
+// usual, it would leave the browser waiting on a kept-alive connection for bytes that never come.
+function declaredLength(want) {
+  let sent = 0;
+  return new Transform({
+    transform(chunk, _enc, done) { sent += chunk.length; done(null, chunk); },
+    flush(done) { done(sent < want ? new Error('the file is shorter than its declared length') : null); },
+  });
 }
 
 // A file, with byte ranges for video (smoother scrubbing). Never cached: a rebuilt page is fresh.
 // The file is opened before any header goes out, so one that cannot be read gets 403 instead of
-// ending the server.
-export function sendFile(req, res, fp, headers = {}) {
-  const f = openRegular(fp);
+// ending the server. `expect` ({ dev, ino }) names the only file that may go out (404 otherwise).
+export function sendFile(req, res, fp, headers = {}, { expect } = {}) {
+  const f = openRegular(fp, expect);
   if (f.status) return send(res, f.status, String(f.status), headers);
+  f.head = req.method === 'HEAD';
   const type = MIME[path.extname(fp).toLowerCase()] || 'application/octet-stream';
   const base = { ...headers, 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
   const range = type.startsWith('video/') ? /bytes=(\d+)-(\d*)/.exec(req.headers.range || '') : null;
   if (range) return sendRange(res, fp, f, range, base, headers);
   res.writeHead(200, { ...base, 'Content-Length': f.size });
-  stream(res, fp, { fd: f.fd, start: 0, end: f.size - 1 });
+  stream(res, fp, { fd: f.fd, start: 0, end: f.size - 1, head: f.head });
 }
 
 function sendRange(res, fp, f, range, base, headers) {
@@ -122,7 +144,7 @@ function sendRange(res, fp, f, range, base, headers) {
     return void res.end();
   }
   res.writeHead(206, { ...base, 'Content-Range': `bytes ${start}-${end}/${f.size}`, 'Content-Length': end - start + 1 });
-  stream(res, fp, { fd: f.fd, start, end });
+  stream(res, fp, { fd: f.fd, start, end, head: f.head });
 }
 
 // True when the request was the PID question, which this answers.
@@ -167,8 +189,12 @@ export const portMatches = (st, port) => !port || st.port === port || st.request
 // The state file of a server for `dir`: beside the folder, so a deployed folder never carries it.
 export const siblingState = (dir) => path.join(path.dirname(dir), `${path.basename(dir)}.server.json`);
 
+// Through a fresh random name opened exclusively, then renamed over the old file: a link at the state
+// file's name (one a repository can bring) is replaced, never written through.
 export function writeState(file, info) {
-  fs.writeFileSync(file, JSON.stringify(info, null, 2) + '\n');
+  const tmp = `${file}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(info, null, 2) + '\n', { flag: 'wx' });
+  try { fs.renameSync(tmp, file); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
 }
 
 export function readState(file) {
@@ -218,10 +244,22 @@ async function waitClosed(port, timeoutMs, host) {
 // A PID a state file may name: a whole number above 1 (never a process group, never init).
 const validPid = (pid) => Number.isInteger(pid) && pid > 1;
 
+// A host a state file may name: this machine (loopback, a wildcard, an address of its own). A state file
+// can come with a repository: its host must not send a request elsewhere, nor pick the PID a signal goes to.
+// A record a stop or a start may act on: a PID that is a process id, on this machine.
+const recordedHere = (st) => validPid(st.pid) && thisMachine(st.host);
+
+// No host is the default loopback one. A loopback address counts only as an IPv4 address of 127/8: `127.evil.test`
+// or `127.256.0.1` is a DNS name, resolved anywhere (a resolver's search domain may answer it).
+export function thisMachine(host) {
+  if (!host || ['0.0.0.0', '::', '::1', 'localhost'].includes(host) || (net.isIPv4(String(host)) && String(host).startsWith('127.'))) return true;
+  return Object.values(os.networkInterfaces()).flat().some((a) => a && a.address === host);
+}
+
 /** True when the server a state file records still answers on its port with its PID. */
 export async function isRunning(stateFile) {
   const st = readState(stateFile);
-  return Boolean(st && st.port) && validPid(st.pid) && (await askPid(st.port, 1500, st.host)) === st.pid;
+  return Boolean(st && st.port) && recordedHere(st) && (await askPid(st.port, 1500, st.host)) === st.pid;
 }
 
 function signal(pid, sig) {
@@ -234,7 +272,7 @@ function signal(pid, sig) {
 export async function stopServer(stateFile, { timeoutMs = 3000 } = {}) {
   const st = readState(stateFile);
   if (!st || !st.port) return { stopped: false, reason: 'no-state' };
-  if (!validPid(st.pid)) return { stopped: false, reason: 'invalid-state' };
+  if (!recordedHere(st)) return { stopped: false, reason: 'invalid-state' };
   const who = await askPid(st.port, Math.min(timeoutMs, 1500), st.host);
   if (who === NONE) {
     dropState(stateFile);

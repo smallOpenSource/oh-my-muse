@@ -1,13 +1,13 @@
 ---
 name: ask
-description: "외부 CLI(Claude/Codex/Gemini/Grok/Cursor) 관점의 어드바이저 요청을 처리. 이 환경에서는 외부 모델 CLI 연동이 불가하므로 병렬 서브에이전트 관점 검토로 대체한다. 사용자가 'codex 관점에서 리뷰해줘', 'gemini 관점으로 UX 제안해줘'처럼 외부 모델 관점의 답변을 요청하면 사용."
+description: "외부 CLI(Claude/Codex/Gemini/Grok/Cursor/Muse) 관점의 어드바이저 요청을 처리. 이 환경에서는 외부 모델 CLI 연동이 불가하므로 병렬 서브에이전트 관점 검토로 대체한다. 사용자가 'codex 관점에서 리뷰해줘', 'gemini 관점으로 UX 제안해줘'처럼 외부 모델 관점의 답변을 요청하면 사용."
 ---
 
 # ask: 관점별 어드바이저
 
 ## Purpose
 
-- 원본: `omc ask` — Claude/Codex/Gemini/Antigravity/Grok/Cursor 로컬 CLI로 프롬프트를 라우팅하고 결과를 ask 아티팩트로 저장하는 어드바이저 스킬.
+- 원본: `omc ask` — Claude/Codex/Gemini/Antigravity/Grok/Cursor/Muse 로컬 CLI로 프롬프트를 라우팅하고 결과를 ask 아티팩트로 저장하는 어드바이저 스킬.
 - **이 환경에서는 외부 모델 CLI 연동이 불가**하므로, 이 스킬은 "관점별 병렬 검토" 대안 워크플로로 이식한다. 외부 모델이 실제로 답하는 것이 아니라, 내부 서브에이전트에 관점을 나눠 맡긴 병렬 검토다.
 
 ## Workflow
@@ -27,7 +27,7 @@ description: "외부 CLI(Claude/Codex/Gemini/Grok/Cursor) 관점의 어드바이
 
 ## Operating Rules
 
-- 한계: 원본의 외부 모델 CLI 라우팅(Claude/Codex/Gemini/Antigravity/Grok/Cursor)과 `omc ask` 래퍼는 이 환경에서 **동작 불가**. `codex`, `gemini`, `cursor-agent` 등 raw CLI를 직접 실행해도 외부 모델이 답하지 않는다.
+- 한계: 원본의 외부 모델 CLI 라우팅(Claude/Codex/Gemini/Antigravity/Grok/Cursor/Muse)과 `omc ask` 래퍼는 이 환경에서 **동작 불가**. `codex`, `gemini`, `cursor-agent`, `muse` 등 raw CLI를 직접 실행해도 외부 모델이 답하지 않는다.
 - 대안: 위 Workflow의 병렬 서브에이전트 관점 검토. "외부 모델의 답변"이라는 표현을 쓰지 말고, 관점별 내부 검토임을 명시한다.
 - 아티팩트 저장: 원본 `.omc/artifacts/ask/<provider>-<slug>-<timestamp>.md` → `~/workspace/` 하위 작업 디렉터리에 관점별 결과를 저장.
 - commands/ask.md 흡수: 해당 파일은 스킬 읽기로의 단순 디스패처라 본문 내용 없음. 트리거 매핑(`/oh-my-claudecode:ask <provider> <질문>` → 채팅 "xxx 관점에서 답해줘")만 이 description에 반영.

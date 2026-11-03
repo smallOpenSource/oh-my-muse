@@ -24,6 +24,6 @@ description: 간단한 브리프를 순서가 있는 목표들의 집합으로 �
 ## Operating Rules
 
 - **Claude Code `/goal` 불가**: 원문은 Claude Code의 `/goal` 슬래시 명령과 연동되지만, 이 환경에는 `/goal` 메커니즘이 없다. `omc ultragoal` CLI와 `/goal` 연동, `--claude-goal-json` 스냅샷, PreToolUse `/goal` 가드는 적용되지 않는다. story 진행은 이 스킬 Workflow의 checkpoint/blocker 단계로 수행한다.
-- **`omc` CLI 불가**: 원문의 `omc ultragoal` 셸 명령은 이 환경에서 제공되지 않는다. 장부·계획 파일(`~/workspace/.omc/ultragoal/`)을 직접 읽고 쓰는 방식으로 대체하고, 동일한 이벤트 의미(start/checkpoint/blocker/failure)를 유지한다.
+- **`omc` CLI 불가**: 원문의 `omc ultragoal` 셸 명령은 이 환경에서 제공되지 않는다. 장부·계획 파일(`~/workspace/.omc/ultragoal/`)을 직접 읽고 쓰는 방식으로 대체하고, 동일한 이벤트 의미(start/checkpoint/blocker/failure)를 유지한다. (업스트림 v5.7.31은 플러그인 전용 설치에서 `omc` 대신 `oh-my-claudecode.js` 진입점을 쓰도록 안내 — 이 환경에는 CLI 자체가 없으므로 해당 없음, 파일 직접 read/write 방식 유지.)
 - **경로 치환**: 원문의 `.omc/ultragoal`은 `~/workspace/.omc/ultragoal/`에 대응한다. MCP 회사 컨텍스트 호출은 해당 도구가 없으면 생략한다.
 - **병렬 세션**: planId를 세션별로 분리해 장부 충돌을 피한다. 이는 원문의 `--plan-id`/`--auto-plan-id` 규칙과 동일하다.

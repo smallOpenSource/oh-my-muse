@@ -25,24 +25,34 @@
  * `node --check`. Exit status 1 means nothing was changed; 2 means an unexpected
  * error stopped the command partway, so check `status`.
  */
+import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const OPEN = "// >>> claude-update-last >>>";
 const CLOSE = "// <<< claude-update-last <<<";
 // A block's body never crosses another opening marker, so a stray one above a
 // block is left over (and refused) instead of taking the code between with it.
-const BLOCKS =
+export const BLOCKS =
   /^[ \t]*\/\/ >>> claude-update-last >>>(?:(?!\/\/ >>> claude-update-last >>>)[\s\S])*?\/\/ <<< claude-update-last <<<[ \t]*(?:\r?\n|(?![\s\S]))/gm;
 // The block goes right before the line that joins the segments into the statusline.
 const JOIN_LINE = /^ {2}let result = colored\.join\(SEP\);\r?$/gm;
 // What the block reads at that line, all in the wrapper's own scope there.
 const NAMES = [/\bconst segs\b/, /\bconst colored\b/, /\bconst stripAnsi\b/, /\bconst A = /];
 
-const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+// The same rules as ../assets/apply-hud.mjs (OMC's getClaudeConfigDir): trim, expand a leading "~",
+// make it absolute, drop a trailing separator, so this finds the wrapper the installer wrote.
+function configDir() {
+  const v = (process.env.CLAUDE_CONFIG_DIR || "").trim();
+  if (!v) return join(homedir(), ".claude");
+  if (v === "~") return homedir();
+  if (v.startsWith("~/") || v.startsWith("~\\")) return join(homedir(), v.slice(2));
+  return resolve(v);
+}
+const CONFIG_DIR = configDir().replace(/[\\/]+$/, "");
 
 const DEFAULTS = {
   hudFile: process.env.CLAUDE_UPDATE_LAST_HUD_FILE || join(CONFIG_DIR, "hud", "omc-hud-custom.mjs"),
@@ -130,7 +140,7 @@ function insertBlock(base) {
 // either name is replaced rather than written through, and a write that fails
 // leaves the old file as it was.
 function writeFresh(file, data) {
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   rmSync(tmp, { force: true });
   try {
     writeFileSync(tmp, data, { flag: "wx" });
@@ -141,12 +151,14 @@ function writeFresh(file, data) {
   }
 }
 
-// The first lines of node's complaint about `text` as an ES module, "" if it parses.
+// The first lines of node's complaint about `text` as an ES module, "" if it parses. A leading BOM
+// is left out: node runs a wrapper that starts with one, but `node --check` rejects a BOM before a
+// shebang (Node 20, 24).
 function syntaxError(text) {
   const dir = mkdtempSync(join(tmpdir(), "claude-update-last-"));
   try {
     const file = join(dir, "check.mjs");
-    writeFileSync(file, text);
+    writeFileSync(file, text.replace(/^\uFEFF/, ""));
     const r = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" });
     return r.status === 0 ? "" : String(r.stderr || r.error).trim().split("\n").slice(0, 3).join(" | ");
   } finally {

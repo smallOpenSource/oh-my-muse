@@ -17,10 +17,10 @@ description: "(banker) 하드코딩·mock/stub·열거형을 read-only 정적 �
 - 이전 세션/에이전트의 "stub 없음" 주장을 **직접 재검증**할 때
 
 ## 불변 원칙
-1. **read-only**: 소스·`pom.xml`/`.eslintrc`/`pyproject.toml`/CI **일절 무변경**. 규칙·러너·결과는 작업용 디렉터리(예: gitignored `.audit/`)에 격리. ast-grep은 search만(replace 금지)
-2. **자격증명 스캔 제외** (audit-security가 담당 — gitleaks/secret 룰 넣지 말 것)
-3. **verify-before-claim**: 모든 finding은 `file:LINE`+스니펫 동반. "0건 = clean 보증" **금지** — 구조규칙은 강한 규칙이라 데이터경로 분기 stub을 놓칠 수 있음 → 정밀감사(레인 B) 필수. 완료 전 4-field(① 변경 ② Evidence ③ 검증 ④ Unknown), ⏳=0일 때만 "완료"
-4. **TP/FP·verdict 분류**: literal이 **화면코드/단위/컬럼키/SQL fragment/라벨/config**면 `legit-constant`(재flag 금지). **숫자/라벨이 응답 row의 DATA VALUE로** 주입되면 `hardcoded-stub`. 데이터 부재 시 **+0/dummy 발명**이면 `fabricated-fallback`. 순수연산은 `legit-computed`(flag 안 함)
+1. **read-only**: 소스·`pom.xml`/`.eslintrc`/`pyproject.toml`/CI **일절 무변경**. 규칙·러너·결과는 감사 대상 저장소 밖의 작업 폴더(`$RESEARCH_DIR`, 없으면 `mktemp -d` 로 만든 개인 폴더)에 격리. 저장소 안의 폴더(예: `.audit/`)는 쓰지 않는다. 저장소가 그 자리에 링크를 심어 두면 결과 쓰기가 링크 너머 파일을 덮는다. 만든 폴더의 경로는 리포트에 적는다. ast-grep은 search만(replace 금지).
+2. **자격증명 스캔 제외** (audit-security가 담당 — gitleaks/secret 룰 넣지 말 것).
+3. **verify-before-claim**: 모든 finding은 `file:LINE`+스니펫 동반. "0건 = clean 보증" **금지** — 구조규칙은 강한 규칙이라 데이터경로 분기 stub을 놓칠 수 있음 → 정밀감사(레인 B) 필수. 완료 전 4-field(① 변경 ② Evidence ③ 검증 ④ Unknown), ⏳=0일 때만 "완료".
+4. **TP/FP·verdict 분류**: literal이 **화면코드/단위/컬럼키/SQL fragment/라벨/config**면 `legit-constant`(재flag 금지). **숫자/라벨이 응답 row의 DATA VALUE로** 주입되면 `hardcoded-stub`. 데이터 부재 시 **+0/dummy 발명**이면 `fabricated-fallback`. 순수연산은 `legit-computed`(flag 안 함).
 
 ## 환경 (도구 — 대상 박스에 맞게)
 - **semgrep**: 격리 venv 권장(`$(command -v semgrep)`). 오래된 glibc 환경(예: RHEL8 glibc 2.28)에선 `manylinux2014` 기반 버전으로 핀(최신 wheel은 glibc 2.29+ 요구로 불가할 수 있음)

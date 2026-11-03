@@ -30,6 +30,7 @@ command -v ffmpeg >/dev/null && ffmpeg -version 2>&1 | head -1 || echo "ffmpeg=�
 **Linux — RHEL8 / Rocky8**: BaseOS/AppStream 미제공(라이선스) → RPM Fusion 필요, 접근 막히면 `ffmpeg-static` 폴백.
 
 **macOS**: `brew install ffmpeg` / **Windows**: `winget install --id Gyan.FFmpeg -e`
+- 오프라인이면 `ffmpeg-static` 도 받을 수 없다(npm 설치에 네트워크가 필요하다). 미리 받아 둔 ffmpeg 실행 파일의 절대 경로를 `export FFMPEG_PATH=<절대 경로>` 로 준다.
 
 **스킬 저장소(`~/workspace/skills/`)에는 ffmpeg 바이너리를 절대 번들하지 않는다.**
 

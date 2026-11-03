@@ -1,6 +1,6 @@
 ---
 name: 3d-intro-build
-description: "스크롤 위치에 맞춰 3D 플라이스루 영상이 움직이는 브랜드 인트로를 만듦. media.generate_image로 씬 스틸을, media.generate_video로 dive-in 클립을 만들고(외부 API·키 불필요), 단계별 검토 페이지 판정 뒤에만 다음 단계로 진행. 결과는 엄격한 CSP에서도 도는 페이지. 사용자가 '3d-intro-build 해줘'/'3D 인트로 만들어줘'/'스크롤 fly-through'/'인트로 영상 사이트'라고 요청하면 사용."
+description: "스크롤 위치에 맞춰 3D 플라이스루 영상이 움직이는 브랜드 인트로를 만듦. media.generate_image로 씬 스틸을, media.generate_video로 dive-in 클립을 만들고(외부 API·키 불필요), 단계별 검토 페이지 판정 뒤에만 다음 단계로 진행. 결과는 엄격한 CSP에서도 도는 페이지(장면 단위 이동 기본). 사용자가 '3d-intro-build 해줘'/'3D 인트로 만들어줘'/'스크롤 fly-through'/'인트로 영상 사이트'라고 요청하면 사용."
 ---
 
 # 3d-intro-build — 스크롤-스크럽 3D 인트로 제작 (내장 media 파이프라인)
@@ -18,7 +18,7 @@ description: "스크롤 위치에 맞춰 3D 플라이스루 영상이 움직이�
 | `references/curate.mjs` | 검토 페이지(스틸, 클립)와 판정 기록 |
 | `references/serve.mjs`, `references/preview-lib.mjs` | 미리보기 서버(빈 포트, 상태 파일, 종료, CSP 헤더) |
 | `references/assemble.mjs` | 인트로 페이지 조립(인라인 script, style 없음) |
-| `references/intro-fixes.css`, `panel-glass.css`, `step-nav.js`, `step-nav.css` | 엔진 덧씌움(수정 파일은 항상, 나머지는 선택) |
+| `references/intro-fixes.css`, `panel-glass.css`, `step-nav.js`, `step-nav.css` | 엔진 덧씌움(수정 파일과 장면 단위 이동은 기본, 유리 패널은 선택) |
 | `references/verify-intro.mjs`, `references/verify.md` | 실제 브라우저 측정과 검증 목록 |
 
 엔진(`references/scrub-engine.js`)과 템플릿(`references/index-template.html`)은 벤더링본이라 **수정하지 않는다**(출처는 `references/NOTICE.md`). 엔진의 결함은 사이트 CSS 와 JS 로 덧씌운다.
@@ -179,6 +179,7 @@ node references/serve.mjs --stop <projectDir>/site           # 끝나면 종료
 - 상태 파일은 `serve.mjs` 가 서빙 폴더 밖(`<site>.server.json`)에, `curate.mjs` 가 프로젝트 폴더(`curate.server.json`)에 둔다. 두 서버 모두 Host 가 localhost 나 IP 주소가 아니면 거절한다(DNS 재바인딩 방지). 종료는 `--stop` 으로 한다.
 - 휴대폰 실기기로 볼 때만 `PREVIEW_HOST=0.0.0.0` 을 쓴다. 같은 네트워크에 미공개 산출물이 보인다는 경고가 나온다.
 - 사용자 검토를 받는다. 지적이 있으면 카피, 매니페스트, 해당 클립만 고치고 다시 조립한다.
+- 이음매와 움직임을 무료로 잰다: `seamReport(projectDir)`(`clip-post.mjs`)가 `intro.json` 순서대로 이음매 SSIM 과 클립별 `cameraMotion`(roll 근사의 누적 회전각, 누적 줌)을 JSON 으로 준다. 평행 이동은 재지 않는다. 수치는 Step 8 보고에 그대로 쓴다.
 
 ---
 

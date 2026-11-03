@@ -1,6 +1,8 @@
 // Tests for payload-mon.mjs. Run from the repo root: node --test skills/payload-mon/scripts/*.test.mjs
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import {
   chmodSync,
   existsSync,
@@ -9,6 +11,8 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -16,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 import { status, turnOff, turnOn } from "./payload-mon.mjs";
 import { CACHE_DIR } from "./payload-size.mjs";
@@ -27,7 +31,23 @@ const root = mkdtempSync(join(tmpdir(), "payload-mon-test-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 
 // Ownership and mode-bit checks, and links made without privileges, are POSIX matters.
-const posixOnly = { skip: process.platform === "win32" && "Windows has no uid or POSIX mode bits" };
+const posixModes = { skip: process.platform === "win32" && "Windows has no uid or POSIX mode bits" };
+// A folder link is a junction on Windows, which needs no privilege; a file link needs one there, so the
+// tests that make one run only where this account can.
+const linkDir = (target, path) => symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
+const canLinkFiles = (() => {
+  const probe = mkdtempSync(join(tmpdir(), "link-probe-"));
+  try {
+    writeFileSync(join(probe, "a"), "");
+    symlinkSync(join(probe, "a"), join(probe, "b"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+const fileLinks = { skip: !canLinkFiles && "this account cannot make file links" };
 
 // Runnable stand-ins for omc-hud-custom.mjs: the lines the block relies on, laid
 // out and indented as in the two real wrappers around omc-hud.mjs.
@@ -98,6 +118,23 @@ const LAYOUTS = [
   ["the older wrapper (spawnSync)", HUD],
   ["the current omc_hud wrapper (in-process)", HUD_INPROC],
 ];
+
+// Wrapper v4 (setup-omc-hud 0.20.0) shows the size in its own PL segment right
+// after the ctx line, where the block also goes. Kept out of LAYOUTS: those
+// tests render the block's payload segment, which v4 replaces with PL.
+const HUD_V4 = HUD_INPROC.replace(
+  "  if (f.ctx) colored.push(colorCtx(f.ctx));\n",
+  [
+    "  if (f.ctx) colored.push(colorCtx(f.ctx));",
+    "  try {",
+    "    const transcript = JSON.parse(input)?.transcript_path;",
+    "    if (transcript) colored.push(`PL:${(0).toFixed(1)}M`);",
+    "  } catch {",
+    "    /* no stdin JSON */",
+    "  }",
+    "",
+  ].join("\n"),
+);
 
 // What another tool's patcher adds to the same wrapper, at the anchors such
 // patchers use, with its own markers.
@@ -177,6 +214,7 @@ for (const [layout, hud] of LAYOUTS) {
     const c = setup(hud);
     const res = turnOn(c);
     assert.equal(res.ok, true, res.message);
+    assert.match(res.message, /8MB 이상이면 ctx 옆에 payload가 표시됩니다/);
     assert.equal(markers(readFileSync(c.hudFile, "utf8")), 1);
     assert.equal(render(c, transcriptOf(c.dir, NINE_MB)), "ctx:21%|<payload:28%/9.0MB>|se:1.0hr\n");
   });
@@ -201,6 +239,20 @@ for (const [layout, hud] of LAYOUTS) {
     assert.equal(existsSync(dirname(copyOf(c))), false);
   });
 }
+
+test("on tells a v4 wrapper that the size shows in its PL segment", () => {
+  const res = turnOn(setup(HUD_V4));
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /PL 칸에 요청 크기가 늘 표시됩니다/);
+  assert.doesNotMatch(res.message, /8MB|ctx 옆/);
+});
+
+test("a v4 wrapper saved with CRLF is still taken for v4", () => {
+  const res = turnOn(setup(HUD_V4.replace(/\n/g, "\r\n")));
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /PL 칸에 요청 크기가 늘 표시됩니다/);
+  assert.doesNotMatch(res.message, /8MB|ctx 옆/);
+});
 
 test("the block imports a copy kept beside the wrapper, so it outlives the plugin folder it came from", () => {
   const c = setup();
@@ -292,6 +344,114 @@ test("a CRLF wrapper goes on and comes off byte for byte", () => {
   assert.equal(render(c, transcriptOf(c.dir, NINE_MB)), "ctx:21%|<payload:28%/9.0MB>|se:1.0hr\n");
   assert.equal(turnOff(c).ok, true);
   assert.equal(readFileSync(c.hudFile, "utf8"), crlf);
+});
+
+test("on and off take a wrapper that starts with a BOM, which node runs as it is", () => {
+  for (const hud of [HUD, HUD_V4]) {
+    // node runs a BOM before the shebang; only `node --check` rejects it.
+    const withBom = "\uFEFF#!/usr/bin/env node\n" + hud;
+    const c = setup(withBom);
+    const on = turnOn(c);
+    assert.equal(on.ok, true, on.message);
+    assert.ok(readFileSync(c.hudFile, "utf8").startsWith("\uFEFF#!"), "the BOM stays");
+    if (hud === HUD) assert.equal(render(c, transcriptOf(c.dir, NINE_MB)), "ctx:21%|<payload:28%/9.0MB>|se:1.0hr\n");
+    const off = turnOff(c);
+    assert.equal(off.ok, true, off.message);
+    assert.equal(readFileSync(c.hudFile, "utf8"), withBom);
+  }
+});
+
+// A line break with no carriage return before it.
+const LF_ONLY = /(^|[^\r])\n/;
+
+test("a CRLF wrapper keeps CRLF on every line while the block is in", () => {
+  const crlf = HUD.replace(/\n/g, "\r\n");
+  const c = setup(crlf);
+  assert.equal(turnOn(c).ok, true);
+  assert.doesNotMatch(readFileSync(c.hudFile, "utf8"), LF_ONLY);
+  assert.match(status(c).message, /payload-mon: 켜짐 \(/);
+  assert.equal(turnOff(c).ok, true);
+  assert.equal(readFileSync(c.hudFile, "utf8"), crlf);
+});
+
+test("status still says on after an editor saves the whole wrapper with CRLF, and on changes nothing", () => {
+  const c = setup();
+  turnOn(c);
+  writeFileSync(c.hudFile, readFileSync(c.hudFile, "utf8").replace(/\r?\n/g, "\r\n"));
+  const saved = readFileSync(c.hudFile, "utf8");
+  assert.match(status(c).message, /payload-mon: 켜짐 \(/);
+  const res = turnOn(c);
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /이미 켜져/);
+  assert.equal(readFileSync(c.hudFile, "utf8"), saved);
+});
+
+test("on rewrites an LF block that 0.20.1 left in a CRLF wrapper", () => {
+  const c = setup();
+  turnOn(c);
+  const lf = readFileSync(c.hudFile, "utf8");
+  const block = /^ {2}\/\/ >>> payload-mon >>>[\s\S]*?\/\/ <<< payload-mon <<<\n/m.exec(lf)[0];
+  const at = lf.indexOf(block);
+  const crlf = (s) => s.replace(/\n/g, "\r\n");
+  writeFileSync(c.hudFile, crlf(lf.slice(0, at)) + block + crlf(lf.slice(at + block.length)));
+  assert.match(status(c).message, /payload-mon: 켜짐 \(/);
+  const res = turnOn(c);
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /켰습니다/);
+  assert.doesNotMatch(readFileSync(c.hudFile, "utf8"), LF_ONLY);
+});
+
+// A wrapper file that is a symlink, as dotfiles setups make: the real file in real/, the link in link/.
+// `inLink` turns it on first as a plain file in link/, the way 0.20.1 left such a setup.
+function linkedWrapper(hudText = HUD_V4, inLink = false) {
+  const c = setup(hudText);
+  const real = join(c.dir, "real");
+  const link = join(c.dir, "link");
+  mkdirSync(real);
+  mkdirSync(link);
+  const linked = { ...c, hudFile: join(link, "omc-hud-custom.mjs"), real, link };
+  renameSync(c.hudFile, linked.hudFile);
+  if (inLink) assert.equal(turnOn(linked).ok, true);
+  renameSync(linked.hudFile, join(real, "omc-hud-custom.mjs"));
+  symlinkSync(join(real, "omc-hud-custom.mjs"), linked.hudFile);
+  return linked;
+}
+
+test("on puts the module copy next to the file a linked wrapper points at, where wrapper v4 looks", fileLinks, () => {
+  const c = linkedWrapper();
+  const res = turnOn(c);
+  assert.equal(res.ok, true, res.message);
+  const copy = join(realpathSync(c.real), "payload-mon", "payload-size.mjs");
+  assert.ok(existsSync(copy), "a copy beside the real file");
+  assert.equal(existsSync(join(c.link, "payload-mon")), false, "nothing beside the link");
+  assert.ok(readFileSync(c.hudFile, "utf8").includes(pathToFileURL(copy).href), "the block imports that copy");
+});
+
+test("a linked wrapper turned on by 0.20.1 shows as incomplete, on moves the copy and off clears both places", fileLinks, () => {
+  const c = linkedWrapper(HUD_V4, true);
+  assert.ok(existsSync(join(c.link, "payload-mon", "payload-size.mjs")), "0.20.1's copy beside the link");
+  assert.match(status(c).message, /불완전하거나 오래됨/);
+  const res = turnOn(c);
+  assert.equal(res.ok, true, res.message);
+  assert.ok(existsSync(join(c.real, "payload-mon", "payload-size.mjs")));
+  assert.match(status(c).message, /payload-mon: 켜짐 \(/);
+  assert.equal(turnOff(c).ok, true);
+  assert.equal(existsSync(join(c.real, "payload-mon")), false);
+  assert.equal(existsSync(join(c.link, "payload-mon")), false);
+});
+
+test("a wrapper reached through a linked folder keeps its copy at the configured path", () => {
+  const c = setup();
+  const real = join(c.dir, "real");
+  mkdirSync(real);
+  renameSync(c.hudFile, join(real, "omc-hud-custom.mjs"));
+  const linkdir = join(c.dir, "linkdir");
+  linkDir(real, linkdir);
+  const viaLink = { ...c, hudFile: join(linkdir, "omc-hud-custom.mjs") };
+  assert.equal(turnOn(viaLink).ok, true);
+  const url = pathToFileURL(join(linkdir, "payload-mon", "payload-size.mjs")).href;
+  assert.ok(readFileSync(viaLink.hudFile, "utf8").includes(url), "the block keeps the folder link's path");
+  assert.match(turnOn(viaLink).message, /이미 켜져/);
 });
 
 test("markers that do not pair up are refused by on and off, which leave the wrapper alone", () => {
@@ -421,8 +581,9 @@ test("on says so when the wrapper is missing", () => {
   assert.match(res.message, /래퍼가 없습니다/);
 });
 
-test("status reports on/off, whether the statusline uses the wrapper, and this session's estimate", () => {
-  const c = setup();
+// A wrapper the statusline runs, with session s1's transcript (1MB) in a projects folder.
+function withSession(hudText) {
+  const c = setup(hudText);
   const projectsDir = join(c.dir, "projects");
   mkdirSync(join(projectsDir, "-work"), { recursive: true });
   writeFileSync(
@@ -431,18 +592,55 @@ test("status reports on/off, whether the statusline uses the wrapper, and this s
   );
   const settingsFile = join(c.dir, "settings.json");
   writeFileSync(settingsFile, JSON.stringify({ statusLine: { type: "command", command: `node ${c.hudFile}` } }));
-  const opts = { ...c, settingsFile, projectsDir, sessionId: "s1" };
+  return { c, settingsFile, opts: { ...c, settingsFile, projectsDir, sessionId: "s1" } };
+}
 
-  assert.match(status(opts).message, /꺼짐/);
+test("status reports on/off, whether the statusline uses the wrapper, and this session's estimate", () => {
+  const { c, settingsFile, opts } = withSession(HUD);
+
+  const off = status(opts).message;
+  assert.match(off, /꺼짐/);
+  assert.match(off, /현재 세션: 1\.0MB \/ 32MB \(3%\)$/m);
+  assert.doesNotMatch(off, /부터 표시/);
   turnOn(c);
   const on = status(opts).message;
   assert.match(on, /payload-mon: 켜짐 \(/);
-  assert.match(on, /현재 세션: 1\.0MB \/ 32MB \(3%\)/);
+  assert.match(on, /현재 세션: 1\.0MB \/ 32MB \(3%\), 8MB부터 표시/);
   assert.doesNotMatch(on, /주의/);
 
   // Another wrapper around the HUD hides its name from the command; say what that means.
   writeFileSync(settingsFile, JSON.stringify({ statusLine: { type: "command", command: "node ~/.claude/wrap.mjs" } }));
   assert.match(status(opts).message, /주의: statusLine 명령에 omc-hud-custom\.mjs가 보이지 않습니다\. 다른 래퍼/);
+});
+
+test("status on a v4 wrapper says where the estimate shows only while it is on", () => {
+  const { c, opts } = withSession(HUD_V4);
+
+  const off = status(opts).message;
+  assert.match(off, /현재 세션: 1\.0MB \/ 32MB \(3%\)$/m);
+  assert.doesNotMatch(off, /PL 칸|부터 표시/);
+  turnOn(c);
+  const on = status(opts).message;
+  assert.match(on, /현재 세션: 1\.0MB \/ 32MB \(3%\), PL 칸에 늘 표시/);
+  assert.doesNotMatch(on, /8MB부터/);
+});
+
+test("status names no display spot while the module copy is missing, v4 or older wrapper", () => {
+  for (const hud of [HUD_V4, HUD]) {
+    const { c, opts } = withSession(hud);
+    turnOn(c);
+    rmSync(copyOf(c));
+    const msg = status(opts).message;
+    assert.match(msg, /모듈 사본이 없어 표시되지 않음/);
+    assert.match(msg, /현재 세션: 1\.0MB \/ 32MB \(3%\)$/m);
+    assert.doesNotMatch(msg, /PL 칸|부터 표시/);
+  }
+});
+
+test("on keeps the older guidance for a wrapper that only mentions PL in a comment", () => {
+  const res = turnOn(setup(HUD_INPROC.replace("const colorRate", "// PL: is what the newer wrapper shows\nconst colorRate")));
+  assert.equal(res.ok, true, res.message);
+  assert.match(res.message, /8MB 이상이면 ctx 옆에 payload가 표시됩니다/);
 });
 
 // The CLI as Claude runs it, kept off the real config folder and the live session.
@@ -528,7 +726,7 @@ test("an unexpected failure partway exits 2, points at status and keeps the wrap
   assert.deepEqual(readdirSync(c.dir).filter((name) => name.endsWith(".tmp")), [], "the failed write's temp file is gone");
 });
 
-test("off leaves alone a cache folder this account does not control", posixOnly, () => {
+test("off leaves alone a cache folder this account does not control", posixModes, () => {
   const c = setup();
   turnOn(c);
   mkdirSync(c.cacheDir);
@@ -539,14 +737,14 @@ test("off leaves alone a cache folder this account does not control", posixOnly,
   assert.equal(readFileSync(c.hudFile, "utf8"), HUD);
 });
 
-test("no other account can change the module copy the statusline imports", posixOnly, () => {
+test("no other account can change the module copy the statusline imports", posixModes, () => {
   const c = setup();
   turnOn(c);
   assert.equal(statSync(copyOf(c)).mode & 0o022, 0, "copy writable by group or others");
   assert.equal(statSync(dirname(copyOf(c))).mode & 0o022, 0, "copy's folder writable by group or others");
 });
 
-test("on replaces a link planted at the copy's name instead of writing through it", posixOnly, () => {
+test("on replaces a link planted at the copy's name instead of writing through it", fileLinks, () => {
   const c = setup();
   mkdirSync(dirname(copyOf(c)), { mode: 0o700 });
   const victim = join(c.dir, "victim.txt");
@@ -558,7 +756,7 @@ test("on replaces a link planted at the copy's name instead of writing through i
   assert.deepEqual(readFileSync(copyOf(c)), readFileSync(MODULE));
 });
 
-test("the backup is written fresh, never through a link planted at its name", posixOnly, () => {
+test("the backup is written fresh, never through a link planted at its name", fileLinks, () => {
   const c = setup();
   const victim = join(c.dir, "victim.txt");
   writeFileSync(victim, "keep me");
@@ -617,8 +815,20 @@ test("a failed refresh keeps the module copy that worked", () => {
   const c = setup();
   turnOn(c);
   writeFileSync(copyOf(c), "// an older version's module\n");
-  mkdirSync(`${copyOf(c)}.${process.pid}.tmp`); // the temp name is taken, so the refresh cannot write
-  const res = turnOn(c);
+  // the refresh's temp file cannot be written (its name is random now, so it cannot be taken beforehand)
+  const write = fs.writeFileSync;
+  fs.writeFileSync = function (p, ...rest) {
+    if (typeof p === "string" && p.startsWith(`${copyOf(c)}.`) && p.endsWith(".tmp")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+    return write.call(this, p, ...rest);
+  };
+  syncBuiltinESMExports();
+  let res;
+  try {
+    res = turnOn(c);
+  } finally {
+    fs.writeFileSync = write;
+    syncBuiltinESMExports();
+  }
   assert.equal(res.ok, false);
   assert.match(res.message, /모듈 사본을 쓰지 못했습니다/);
   assert.equal(readFileSync(copyOf(c), "utf8"), "// an older version's module\n");
@@ -631,4 +841,350 @@ test("a folder made for the copy is taken away again when the copy cannot be wri
   assert.match(res.message, /모듈 사본을 쓰지 못했습니다/);
   assert.equal(existsSync(dirname(copyOf(c))), false);
   assert.equal(readFileSync(c.hudFile, "utf8"), HUD);
+});
+
+test("CLAUDE_CONFIG_DIR 가 따옴표 안 ~/x 여도 홈 아래 래퍼를 씀", () => {
+  const c = setup();
+  const config = join(c.dir, "x");
+  const hudFile = join(config, "hud", "omc-hud-custom.mjs");
+  mkdirSync(dirname(hudFile), { recursive: true });
+  writeFileSync(hudFile, HUD);
+  // A value a shell never expanded ("~/x", say, in quotes), with a stray space: setup-omc-hud's installer
+  // reads it as <home>/x, so payload-mon has to find the wrapper there too.
+  const env = cliEnv(c, { PAYLOAD_MON_HUD_FILE: "", CLAUDE_CONFIG_DIR: "~/x " });
+  const on = spawnSync(process.execPath, [CLI, "on"], { encoding: "utf8", env });
+  assert.equal(on.status, 0, on.stdout);
+  assert.equal(markers(readFileSync(hudFile, "utf8")), 1);
+  assert.ok(existsSync(join(config, "hud", "payload-mon", "payload-size.mjs")));
+  const shown = spawnSync(process.execPath, [CLI, "status"], { encoding: "utf8", env });
+  assert.ok(shown.stdout.includes(`(${hudFile})`), shown.stdout);
+});
+
+test("on and off finish quickly on a 3MB wrapper of closing then opening markers", () => {
+  const strays = "// <<< payload-mon <<<\n".repeat(65000) + "// >>> payload-mon >>>\n".repeat(65000);
+  const c = setup(HUD_V4 + strays);
+  for (const run of [turnOff, turnOn]) {
+    const started = Date.now();
+    run(c);
+    const took = Date.now() - started;
+    assert.ok(took < 5000, `${run.name} took ${took}ms`);
+  }
+});
+
+test("on refuses to write the module copy into a copy folder that is a link, and leaves the wrapper alone", () => {
+  const c = setup(HUD_V4);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  linkDir(outside, join(c.dir, "payload-mon"));
+  const before = readFileSync(c.hudFile);
+  const on = turnOn(c);
+  assert.equal(on.ok, false, on.message);
+  assert.match(on.message, /사본 폴더가 링크입니다/);
+  assert.ok(readFileSync(c.hudFile).equals(before));
+  assert.equal(existsSync(join(outside, "payload-size.mjs")), false);
+});
+
+test("off does not delete through a copy folder that is a link", () => {
+  const c = setup(HUD_V4);
+  assert.equal(turnOn(c).ok, true);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "payload-size.mjs"), "// a file of someone else's\n");
+  rmSync(join(c.dir, "payload-mon"), { recursive: true });
+  linkDir(outside, join(c.dir, "payload-mon"));
+  const off = turnOff(c);
+  assert.equal(off.ok, true, off.message);
+  assert.ok(existsSync(join(outside, "payload-size.mjs")));
+  assert.match(off.message, /사본 폴더가 링크라 모듈 사본은 지우지 않았습니다/);
+});
+
+test("status names a copy folder that is a link instead of pointing at on", () => {
+  const c = setup(HUD_V4);
+  assert.equal(turnOn(c).ok, true);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  rmSync(join(c.dir, "payload-mon"), { recursive: true });
+  linkDir(outside, join(c.dir, "payload-mon"));
+  const shown = status(c).message;
+  assert.match(shown, /사본 폴더가 링크/);
+  assert.doesNotMatch(shown, /on 으로 복구/);
+});
+
+test("off on a wrapper link that leads nowhere says there is nothing to turn off", fileLinks, () => {
+  const c = setup(HUD_V4);
+  rmSync(c.hudFile);
+  symlinkSync(join(c.dir, "gone.mjs"), c.hudFile);
+  const off = turnOff(c);
+  assert.equal(off.ok, true, off.message);
+  assert.match(off.message, /HUD 래퍼가 없어 끌 것이 없습니다/);
+});
+
+// A preload for the CLI that plays a second program racing payload-mon: right before payload-mon writes
+// its temporary copy, the copy folder becomes a link to `outside`. With `after`, that program also puts
+// its own file there once payload-mon has renamed its copy in.
+function swapPreload(outside, after = null) {
+  const file = join(root, `swap-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs, { rmSync, symlinkSync, writeFileSync as write0 } from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { dirname } from "node:path";',
+    "const write = fs.writeFileSync;",
+    "const rename = fs.renameSync;",
+    "let swapped = false;",
+    "fs.writeFileSync = function (p, ...rest) {",
+    "  if (!swapped && typeof p === \"string\" && /payload-mon[\\\\/]payload-size\\.mjs\\.\\d+\\.[0-9a-f]+\\.tmp$/.test(p)) {",
+    "    swapped = true;",
+    "    rmSync(dirname(p), { recursive: true, force: true });",
+    `    symlinkSync(${JSON.stringify(outside)}, dirname(p), process.platform === "win32" ? "junction" : "dir");`,
+    "  }",
+    "  return write.call(this, p, ...rest);",
+    "};",
+    "fs.renameSync = function (from, to) {",
+    "  rename.call(this, from, to);",
+    after === null ? "" : `  if (swapped && /payload-size\\.mjs$/.test(to)) write0(to, ${JSON.stringify(after)});`,
+    "};",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+const onWith = (c, ...preloads) =>
+  spawnSync(process.execPath, [...preloads.flatMap((p) => ["--import", pathToFileURL(p).href]), CLI, "on"], {
+    encoding: "utf8",
+    env: cliEnv(c),
+  });
+
+test("on refuses and takes back its copy when the copy folder turns into a link while it writes", () => {
+  const c = setup(HUD_V4);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  const before = readFileSync(c.hudFile);
+  const r = onWith(c, swapPreload(outside));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 쓰는 동안 바뀌었습니다/);
+  assert.equal(existsSync(join(outside, "payload-size.mjs")), false, "the copy written through the link was taken back");
+  assert.ok(readFileSync(c.hudFile).equals(before));
+});
+
+test("the take-back leaves a different file in the swapped folder alone", () => {
+  const c = setup(HUD_V4);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  const r = onWith(c, swapPreload(outside, "// a file of someone else's\n"));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 쓰는 동안 바뀌었습니다/);
+  assert.equal(readFileSync(join(outside, "payload-size.mjs"), "utf8"), "// a file of someone else's\n");
+});
+
+// Another racing program: right after payload-mon makes the copy folder (before it stamps the folder and
+// writes the copy), the folder becomes a link to `outside`.
+function mkdirSwapPreload(outside) {
+  const file = join(root, `mkdir-swap-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs, { rmSync, symlinkSync } from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    "const mkdir = fs.mkdirSync;",
+    "let swapped = false;",
+    "fs.mkdirSync = function (p, ...rest) {",
+    "  const made = mkdir.call(this, p, ...rest);",
+    "  if (!swapped && typeof p === \"string\" && /[\\\\/]payload-mon$/.test(p)) {",
+    "    swapped = true;",
+    "    rmSync(p, { recursive: true, force: true });",
+    `    symlinkSync(${JSON.stringify(outside)}, p, process.platform === "win32" ? "junction" : "dir");`,
+    "  }",
+    "  return made;",
+    "};",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+
+test("on refuses a copy folder that turns into a link right after it is made, before the copy is written", () => {
+  const c = setup(HUD_V4);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  const before = readFileSync(c.hudFile);
+  const r = onWith(c, mkdirSwapPreload(outside));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 링크입니다/);
+  assert.deepEqual(readdirSync(outside), [], "nothing was written through the link");
+  assert.ok(readFileSync(c.hudFile).equals(before));
+});
+
+test("on refuses a copy folder that became a link even when the copy in it is current", () => {
+  const c = setup(HUD_V4);
+  assert.equal(turnOn(c).ok, true);
+  const outside = join(c.dir, "outside");
+  renameSync(join(c.dir, "payload-mon"), outside);
+  linkDir(outside, join(c.dir, "payload-mon"));
+  const on = turnOn(c);
+  assert.equal(on.ok, false, on.message);
+  assert.match(on.message, /사본 폴더가 링크입니다/);
+});
+
+test("off does not delete through the old copy folder beside a linked wrapper when that folder is a link", fileLinks, () => {
+  const c = linkedWrapper();
+  assert.equal(turnOn(c).ok, true);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "payload-size.mjs"), "// a file of someone else's\n");
+  linkDir(outside, join(c.link, "payload-mon"));
+  assert.equal(turnOff(c).ok, true);
+  assert.ok(existsSync(join(outside, "payload-size.mjs")));
+});
+
+// B1-6: a racing program that puts the folder back. Right before payload-mon writes its temporary copy, the copy
+// folder is moved aside and a link to `outside` takes its name; once payload-mon has renamed its copy in, the link
+// goes and the folder comes back. The folder is then the one payload-mon stamped, without the copy in it.
+function restorePreload(outside) {
+  const file = join(root, `restore-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs, { symlinkSync, unlinkSync, rmdirSync } from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { dirname } from "node:path";',
+    "const write = fs.writeFileSync;",
+    "const rename = fs.renameSync;",
+    "let dir = null;",
+    "fs.writeFileSync = function (p, ...rest) {",
+    '  if (dir === null && typeof p === "string" && /payload-mon[\\\\/]payload-size\\.mjs\\.\\d+\\.[0-9a-f]+\\.tmp$/.test(p)) {',
+    "    dir = dirname(p);",
+    '    rename.call(fs, dir, dir + ".aside");',
+    `    symlinkSync(${JSON.stringify(outside)}, dir, process.platform === "win32" ? "junction" : "dir");`,
+    "  }",
+    "  return write.call(this, p, ...rest);",
+    "};",
+    "fs.renameSync = function (from, to) {",
+    "  rename.call(this, from, to);",
+    "  if (dir !== null && /payload-mon[\\\\/]payload-size\\.mjs$/.test(to)) {",
+    '    if (process.platform === "win32") rmdirSync(dir); else unlinkSync(dir);',
+    '    rename.call(fs, dir + ".aside", dir);',
+    "  }",
+    "};",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+
+test("on refuses when the copy folder was swapped and put back while it wrote, leaving no copy in it", () => {
+  const c = setup(HUD_V4);
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  const before = readFileSync(c.hudFile);
+  const r = onWith(c, restorePreload(outside));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 쓰는 동안 바뀌었습니다/);
+  assert.ok(readFileSync(c.hudFile).equals(before));
+});
+
+// B1-7: a racing program that swaps the folder after payload-mon wrote into it. Once payload-mon has renamed its
+// copy in, the copy folder is moved aside and a link to `outside` takes its name.
+function lateSwapPreload(outside) {
+  const file = join(root, `late-swap-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs, { symlinkSync } from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { dirname } from "node:path";',
+    "const rename = fs.renameSync;",
+    "let done = false;",
+    "fs.renameSync = function (from, to) {",
+    "  rename.call(this, from, to);",
+    "  if (!done && /payload-mon[\\\\/]payload-size\\.mjs$/.test(to)) {",
+    "    done = true;",
+    '    rename.call(fs, dirname(to), dirname(to) + ".aside");',
+    `    symlinkSync(${JSON.stringify(outside)}, dirname(to), process.platform === "win32" ? "junction" : "dir");`,
+    "  }",
+    "};",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+
+// Deferred 17: a preload under which every file number passes 2^53, as NTFS file IDs do (seen on the Windows test
+// box): the numbers stay apart as BigInt and all read as one Number.
+function highIdPreload() {
+  const file = join(root, `high-id-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    "const ids = new Map();",
+    "const high = (st) => {",
+    "  const key = `${st.dev}:${st.ino}`;",
+    "  if (!ids.has(key)) ids.set(key, (1n << 60n) + BigInt(ids.size + 1));",
+    "  return ids.get(key);",
+    "};",
+    'for (const name of ["lstatSync", "statSync", "fstatSync"]) {',
+    "  const real = fs[name];",
+    "  fs[name] = function (p, opts) {",
+    "    const st = real.call(this, p, opts);",
+    "    if (st) st.ino = opts?.bigint ? high(st) : Number(high(st));",
+    "    return st;",
+    "  };",
+    "}",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+
+// Another wrapper's copy, current, in the folder the copy folder turns into.
+function otherWrapperCopy(c) {
+  const outside = join(c.dir, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "payload-size.mjs"), readFileSync(MODULE));
+  return outside;
+}
+
+test("the take-back leaves a copy that was already in the folder the copy folder turned into", () => {
+  const c = setup(HUD_V4);
+  const outside = otherWrapperCopy(c);
+  const r = onWith(c, lateSwapPreload(outside));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 쓰는 동안 바뀌었습니다/);
+  assert.ok(existsSync(join(outside, "payload-size.mjs")), "the other wrapper's copy stays");
+});
+
+// Deferred 17: a racing program that puts another real folder in place: once payload-mon has renamed its copy in,
+// the copy folder is moved aside and a new folder holding the same bytes takes its name, so only the folder's
+// number tells the two apart.
+function realSwapPreload(bytesFrom) {
+  const file = join(root, `real-swap-${++seq}.mjs`);
+  writeFileSync(file, [
+    'import fs, { copyFileSync, mkdirSync } from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { dirname } from "node:path";',
+    "const rename = fs.renameSync;",
+    "let done = false;",
+    "fs.renameSync = function (from, to) {",
+    "  rename.call(this, from, to);",
+    "  if (!done && /payload-mon[\\\\/]payload-size\\.mjs$/.test(to)) {",
+    "    done = true;",
+    '    rename.call(fs, dirname(to), dirname(to) + ".aside");',
+    "    mkdirSync(dirname(to));",
+    `    copyFileSync(${JSON.stringify(bytesFrom)}, to);`,
+    "  }",
+    "};",
+    "syncBuiltinESMExports();",
+    "",
+  ].join("\n"));
+  return file;
+}
+
+test("on refuses a copy folder replaced by another real folder while it writes, also where folder numbers pass 2^53", () => {
+  const c = setup(HUD_V4);
+  const before = readFileSync(c.hudFile);
+  const r = onWith(c, highIdPreload(), realSwapPreload(MODULE));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /사본 폴더가 쓰는 동안 바뀌었습니다/);
+  assert.ok(readFileSync(c.hudFile).equals(before));
+});
+
+test("the take-back tells files apart by their whole number where file numbers pass 2^53", () => {
+  const c = setup(HUD_V4);
+  const outside = otherWrapperCopy(c);
+  const r = onWith(c, highIdPreload(), lateSwapPreload(outside));
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.ok(existsSync(join(outside, "payload-size.mjs")), "the other wrapper's copy stays");
 });

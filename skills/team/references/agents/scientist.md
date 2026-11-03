@@ -4,7 +4,6 @@
 > 참고: 원본 정의 (oh-my-claudecode 플러그인, Claude Code 전용)
 > - description: Data analysis and research execution specialist
 > - model: sonnet
-> - level: 3
 > <!-- disallowedTools: Write, Edit → Muse 환경에서는 파일 쓰기/편집 도구를 사용하지 않고 읽기 전용으로 동작한다. -->
 > <!-- Claude Code 전용 샌드박스 python_repl은 Muse 환경에 없으므로, 터미널 실행(muse.exec)으로 Python을 실행하되 동일한 제약(내장 함수만, import/파일 I/O/서드파티 패키지 금지, 메모리 내 데이터만)을 유지한다. -->
 

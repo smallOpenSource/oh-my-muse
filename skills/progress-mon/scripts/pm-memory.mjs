@@ -1,0 +1,435 @@
+// pm-memory.mjs: 메모리 규칙 등록(계획 6.2절). 표식으로 중복을 막고 사용자 파일은 끝에 덧붙이기만 한다.
+// 예외: 표식이 붙은 우리 줄(앞머리로 가린 규칙 줄과 색인 줄)이 지금 판과 다르면 그 줄만 제자리에서 바꾼다(첫 원본은 .progress-mon.bak).
+// 대상 파일은 에이전트가 넘긴다(--memory, --memory-dir). 스크립트는 HOME 아래 쓰기 경로를 스스로 만들지 않는다.
+// 덧붙인 뒤 규칙 로드 한도를 재고 경고 줄을 낸다(종료 코드는 그대로). status, check 도 같은 측정을 다시 한다.
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { git, readRegular, realNative, UsageError, writeNew } from './pm-config.mjs';
+
+export const MARKER = '<!-- progress-mon:rule -->';
+export const OMX_OPEN = '<!-- USER:OMX:POLICY:START -->';
+export const OMX_CLOSE = '<!-- USER:OMX:POLICY:END -->';
+const KINDS = ['claude-md', 'agents-md', 'auto-memory', 'none'];
+
+// 규칙 줄. 경로는 자료 폴더 기준 상대 표기뿐(스킬 폴더 절대 경로는 state.json 의 skillDir).
+export function ruleLine(runtime) {
+  if (runtime === 'codex') {
+    return `진척도 화면(progress-mon): 모든 명령에 --runtime codex 를 붙임. 단계는 stage, 스토리는 story, 그 밖 작업은 item 으로 갱신. 결정이 생기거나 스토리가 끝나면 .omx/progress-mon/adr.json(ADR 탭)을 고치고 check. .omx/progress-mon/state.json 의 skillDir 아래 scripts/progress-mon.mjs 를 node 로 직접 실행하고, 실패하면 banker-progress-mon 스킬(플러그인 설치는 banker:progress-mon)로 호출. 세션 시작 때 status, 꺼져 있으면 start. start, stop, status 는 sandbox_permissions "require_escalated" 로 승인 요청. 세션을 닫아도 화면을 두려면 사용자 터미널에서 serve 실행을 안내. ${MARKER}`;
+  }
+  return `진척도 화면(progress-mon): 단계는 stage, 스토리는 story, 그 밖 작업은 item 으로 갱신. 결정이 생기거나 스토리가 끝나면 .omc/progress-mon/adr.json(ADR 탭)을 고치고 check. .omc/progress-mon/state.json 의 skillDir 아래 scripts/progress-mon.mjs 를 node 로 직접 실행하고, 실패하면 progress-mon 스킬로 호출. 세션 시작 때 status, 꺼져 있으면 start. ${MARKER}`;
+}
+
+// 자동 메모리 규칙 파일(새로 만들 때)과 MEMORY.md 색인 줄.
+const ruleFile = (runtime) => `---
+name: progress-mon
+description: 진척도 화면(progress-mon) 갱신 규칙. 단계, 스토리, 그 밖 작업을 stage, story, item 으로, 결정은 adr.json 에 기록
+metadata:
+  type: feedback
+---
+
+${ruleLine(runtime)}
+`;
+export const INDEX_LINE = `- [진척도 화면 갱신 규칙](progress-mon.md) - stage, story, item 과 adr.json 으로 progress-mon 갱신 ${MARKER}`;
+
+// 표식 줄 가운데 우리가 쓴 줄을 가리는 앞머리. 규칙 줄의 런타임은 `--runtime codex` 가 있으면 codex.
+const RULE_HEAD = '진척도 화면(progress-mon):';
+const INDEX_HEAD = '- [진척도 화면 갱신 규칙](progress-mon.md)';
+// 표식 줄이 지금 판에서 되어야 할 줄. 앞머리가 다른 표식 줄(사용자가 쓴 줄 등)은 null(손대지 않음).
+export function currentLine(line) {
+  if (!line.includes(MARKER)) return null;
+  if (line.startsWith(INDEX_HEAD)) return INDEX_LINE;
+  if (line.startsWith(RULE_HEAD)) return ruleLine(line.includes('--runtime codex') ? 'codex' : 'claude');
+  return null;
+}
+
+// ---------- 한도 ----------
+
+const MEMORY_LIMIT = { lines: 200, bytes: 25000 };
+const CODEX_DEFAULT_BYTES = 32768;
+const nine = (n) => Math.ceil(n * 0.9);
+const comma = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+// Codex 가 파일을 빈 것으로 보는 기준(Rust trim 과 같이 BOM 은 글로 친다).
+const hasContent = (text) => /\P{White_Space}/u.test(text);
+
+// 줄 수: 마지막 줄 끝의 줄바꿈은 줄을 늘리지 않는다.
+export function lineCount(text) {
+  if (!text) return 0;
+  const n = text.split('\n').length;
+  return text.endsWith('\n') ? n - 1 : n;
+}
+
+// MEMORY.md 한 파일의 측정. 돌려줌: { lines, bytes, level: 'over' | 'near' | null }
+export function measureMemory(file) {
+  let buf;
+  try {
+    buf = readRegular(file, null);
+  } catch {
+    return { lines: 0, bytes: 0, level: null };
+  }
+  const lines = lineCount(buf.toString('utf8'));
+  const bytes = buf.length;
+  const level = lines >= MEMORY_LIMIT.lines || bytes >= MEMORY_LIMIT.bytes ? 'over' : lines >= nine(MEMORY_LIMIT.lines) || bytes >= nine(MEMORY_LIMIT.bytes) ? 'near' : null;
+  return { lines, bytes, level };
+}
+
+// $CODEX_HOME/config.toml 의 최상위 project_doc_max_bytes(읽기만). 첫 [표] 머리 전의 줄만 보고 주석은 뺀다.
+// 돌려줌: { bytes, assumed } (파일이 없거나 값이 정수가 아니면 기본값 가정)
+export function codexLimit(env = process.env) {
+  const home = env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  let text;
+  try {
+    text = readRegular(path.join(home, 'config.toml'));
+  } catch {
+    return { bytes: CODEX_DEFAULT_BYTES, assumed: true };
+  }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (line.startsWith('[')) break;
+    const m = /^project_doc_max_bytes\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const v = m[1].trim();
+    if (!/^\+?\d+(?:_\d+)*$/.test(v)) return { bytes: CODEX_DEFAULT_BYTES, assumed: true };
+    return { bytes: Number(v.replace(/[+_]/g, '')), assumed: false };
+  }
+  return { bytes: CODEX_DEFAULT_BYTES, assumed: true };
+}
+
+// ---------- Codex 쓰기 대상(계획 6.2절 표) ----------
+
+const readText = (file) => {
+  try {
+    return readRegular(file);
+  } catch {
+    return null;
+  }
+};
+
+// banker 블록과 우리 블록을 뺀 글. 안이 빈 USER:OMX:POLICY 묶음도 뺀다.
+export function ownText(text) {
+  const kept = [];
+  let banker = null;
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (banker) {
+      if (t === `<!-- banker:${banker}:end -->`) banker = null;
+      continue;
+    }
+    const m = /^<!-- banker:([a-z0-9-]+):start -->$/.exec(t);
+    if (m) {
+      banker = m[1];
+      continue;
+    }
+    if (line.includes(MARKER)) continue;
+    kept.push(line);
+  }
+  const out = [];
+  for (let i = 0; i < kept.length; i++) {
+    if (kept[i].trim() === OMX_OPEN) {
+      let j = i + 1;
+      while (j < kept.length && kept[j].trim() !== OMX_CLOSE && !hasContent(kept[j])) j++;
+      if (j < kept.length && kept[j].trim() === OMX_CLOSE) {
+        i = j;
+        continue;
+      }
+    }
+    out.push(kept[i]);
+  }
+  return out.join('\n');
+}
+
+// 폴더 하나에서 Codex 가 읽는 파일과 우리가 쓸 파일. shadow: override 에 블록만 있어 AGENTS.md 가 가려짐.
+export function codexTarget(dir) {
+  const override = path.join(dir, 'AGENTS.override.md');
+  const main = path.join(dir, 'AGENTS.md');
+  const ot = readText(override);
+  if (ot === null || !hasContent(ot)) return { file: main, shadow: false };
+  return { file: override, shadow: !hasContent(ownText(ot)) };
+}
+
+const gitTop = (dir) => {
+  try {
+    return path.resolve(git(dir, ['rev-parse', '--show-toplevel']));
+  } catch {
+    return null;
+  }
+};
+
+// Codex 프로젝트 지시 합계: 저장소 루트에서 프로젝트 루트까지 각 폴더에서 Codex 가 읽는 파일 크기의 합.
+export function measureCodex(project, env = process.env) {
+  const limit = codexLimit(env);
+  // 둘 다 디스크의 철자로 푼다: 링크나 다른 대소문자로 준 --project 가 저장소 밖으로 보여 지시 파일을 빼먹지 않게
+  const proj = realNative(path.resolve(project));
+  const top0 = gitTop(proj);
+  const top = top0 && realNative(top0);
+  const rel = top ? path.relative(top, proj) : '';
+  const dirs = [top && !rel.startsWith('..') && !path.isAbsolute(rel) ? top : proj];
+  if (dirs[0] !== proj) for (const part of rel.split(path.sep).filter(Boolean)) dirs.push(path.join(dirs[dirs.length - 1], part));
+  let total = 0;
+  for (const d of dirs) {
+    try {
+      total += fs.statSync(codexTarget(d).file).size;
+    } catch {
+      // 그 폴더에 지시 파일 없음
+    }
+  }
+  const level = limit.bytes === 0 ? 'off' : total >= limit.bytes ? 'over' : total >= nine(limit.bytes) ? 'near' : null;
+  return { total, limit: limit.bytes, assumed: limit.assumed, level };
+}
+
+// ---------- 경고 줄 ----------
+
+const MEM_ALT = '대안: --memory claude-md 로 다시 등록(CLAUDE.md 는 한도 없음)';
+// init 의 메모리 대상이 거부될 때 안내하는 종류별 대안.
+const CLAUDE_ALT = '대안: --memory agents-md, 또는 --memory auto-memory --memory-dir <dir>';
+const AGENTS_ALT = '대안: --memory claude-md, 또는 --memory auto-memory --memory-dir <dir>';
+const AUTO_ALT = '대안: 다른 --memory-dir, 또는 --memory claude-md 나 agents-md';
+const CODEX_ALT = '대안: 프로젝트 지시 파일 정리(banker cleansing-memory)';
+export const SHADOW_WARN = '경고: AGENTS.override.md 에 블록만 있어 AGENTS.md 가 가려짐';
+
+function memoryLines(m) {
+  const lim = `로드 한도(${MEMORY_LIMIT.lines}줄 또는 ${comma(MEMORY_LIMIT.bytes)} B)`;
+  if (m.level === 'over') return [`경고: MEMORY.md 가 ${lim}를 넘어 규칙이 로드되지 않음`, MEM_ALT];
+  if (m.level === 'near') return [`경고: MEMORY.md 가 ${lim}의 90% 이상이라 규칙이 곧 로드 밖으로 밀릴 수 있음`, MEM_ALT];
+  return [];
+}
+
+function codexLines(c) {
+  if (c.level === 'off') return ['경고: Codex 프로젝트 문서 로딩이 꺼져 있어 규칙이 로드되지 않음', '대안: config.toml 의 project_doc_max_bytes 설정 확인'];
+  const lim = `로드 한도(${comma(c.limit)} B${c.assumed ? ', 기본값 가정' : ''})`;
+  if (c.level === 'over') return [`경고: Codex 프로젝트 지시 합계가 ${lim}를 넘어 규칙이 로드되지 않음`, CODEX_ALT];
+  if (c.level === 'near') return [`경고: Codex 프로젝트 지시 합계가 ${lim}의 90% 이상이라 규칙이 곧 로드 밖으로 밀릴 수 있음`, CODEX_ALT];
+  return [];
+}
+
+// state.json 의 memory 로 다시 잰 경고 줄(status, check, init 이 같이 씀). 경고가 없으면 빈 목록.
+export function memoryWarnings(memory, project, env = process.env) {
+  if (!memory || typeof memory !== 'object') return [];
+  if (memory.kind === 'auto-memory' && typeof memory.path === 'string') return memoryLines(measureMemory(memory.path));
+  if (memory.kind === 'agents-md') return [...(codexTarget(project).shadow ? [SHADOW_WARN] : []), ...codexLines(measureCodex(project, env))];
+  return [];
+}
+
+// ---------- 쓰기 ----------
+
+// 경로 b 가 폴더 a 안(같음 포함)인지.
+const within = (a, b) => {
+  const rel = path.relative(a, b);
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+};
+
+// 링크의 대상 stat. 대상이 없거나 실제 경로가 base 밖이면 UsageError.
+function linkTarget(file, name, base, tail) {
+  let st;
+  let real;
+  try {
+    st = fs.statSync(file);
+    real = fs.realpathSync(file);
+  } catch {
+    throw new UsageError(`${name} 은 대상이 없는 링크라 거부${tail}`);
+  }
+  if (!within(fs.realpathSync(base), real)) throw new UsageError(`${name} 은 ${path.basename(base)} 밖을 가리키는 링크라 거부${tail}`);
+  return st;
+}
+
+// 파일을 UTF-8 로 읽는다(BOM 은 뗌). UTF-8 이 아니면 UsageError.
+function readUtf8(file, name, tail) {
+  const buf = fs.readFileSync(file);
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    throw new UsageError(`${name} 이 UTF-8 이 아니라 거부${tail}`);
+  }
+}
+
+// 덧붙일 수 있는 파일인지. 일반 파일이나, 실제 경로가 base(프로젝트 루트나 --memory-dir) 안인 일반 파일을 가리키는 링크만.
+// 저장소가 심은 링크로 밖의 파일에 덧붙이지 않게 한다. CLAUDE.md -> AGENTS.md 같은 안쪽 링크는 받는다. 없으면 새로 만든다.
+// 하드링크(nlink > 1)는 거부한다. 다른 이름이 어디 있는지 알 수 없어, 밖의 파일과 같은 내용일 수 있다.
+// 돌려줌: { exists, text, eol }. 거부는 UsageError.
+function inspect(file, name, base, alt = '') {
+  const tail = alt ? `. ${alt}` : '';
+  let lst;
+  try {
+    lst = fs.lstatSync(file);
+  } catch (e) {
+    if (e.code === 'ENOENT') return { exists: false, text: '', eol: '\n' };
+    throw new UsageError(`${name} 을 읽지 못함(${e.code || e.message})${tail}`);
+  }
+  const st = lst.isSymbolicLink() ? linkTarget(file, name, base, tail) : lst;
+  if (!st.isFile()) throw new UsageError(`${name} 은 일반 파일이 아니라 거부${tail}`);
+  if (st.nlink > 1) throw new UsageError(`${name} 은 하드링크(이름 ${st.nlink}개)라 거부${tail}`);
+  const text = readUtf8(file, name, tail);
+  // TextDecoder 는 BOM 을 떼므로 줄 끝 판정만 쓴다. 쓰기는 원본 바이트 뒤에 덧붙인다.
+  return { exists: true, text, eol: text.includes('\r\n') ? '\r\n' : '\n' };
+}
+
+const changedError = (file) => new UsageError(`${path.basename(file)} 이 검사 뒤 하드링크나 특수 파일로 바뀌어 쓰지 않음`);
+
+// 원본 바이트를 그대로 두고 끝에 줄을 덧붙인다. 마지막 줄에 줄바꿈이 없으면 먼저 넣는다.
+// 연 fd 를 fstat 으로 다시 본다: 검사(inspect)와 쓰기 사이에 하드링크나 특수 파일로 바뀌었으면 쓰지 않는다.
+function append(file, info, lines) {
+  const glue = info.text && !info.text.endsWith('\n') ? info.eol : '';
+  const body = glue + lines.join(info.eol) + info.eol;
+  // O_NONBLOCK: 검사 뒤 FIFO 로 바뀐 자리에서 open 이 읽는 쪽을 기다리며 멈추지 않게 한다(Windows 에는 없어 0)
+  const { O_WRONLY, O_APPEND, O_CREAT, O_EXCL } = fs.constants;
+  const flags = O_WRONLY | (fs.constants.O_NONBLOCK || 0) | O_CREAT | (info.exists ? O_APPEND : O_EXCL);
+  const changed = () => changedError(file);
+  let fd;
+  try {
+    fd = fs.openSync(file, flags, 0o666);
+  } catch (e) {
+    // 읽는 쪽이 없는 FIFO(ENXIO)는 검사 뒤 바뀐 자리다. EAGAIN 은 막힌 특수 파일이나 다른 프로세스의 잠금(lease)일 수 있다.
+    // 둘 다 날 오류 대신 거부 문구로 끝낸다
+    if (e.code === 'ENXIO') throw changed();
+    if (e.code === 'EAGAIN') throw new UsageError(`${path.basename(file)} 이 검사 뒤 바뀌었거나 다른 프로세스가 잡고 있어 쓰지 않음`);
+    throw e;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.nlink > 1) throw changed();
+    fs.writeFileSync(fd, body); // 다 쓸 때까지 반복
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// 등록 계획. 쓰기 전에 대상을 모두 검사한다(거부면 아무것도 바꾸지 않음).
+// o: { kind, memoryDir, project, runtime }. 돌려줌: { kind, runtime, steps, memory: {kind, path} }
+export function planMemory({ kind, memoryDir, project, runtime }) {
+  if (kind === undefined) throw new UsageError('init 에는 --memory claude-md|agents-md|auto-memory|none 가 필요함');
+  if (!KINDS.includes(kind)) throw new UsageError(`--memory 는 ${KINDS.join(', ')} 가운데 하나(받은 값 ${kind})`);
+  if (kind === 'none') return { kind, runtime, steps: [], memory: { kind, path: null } };
+  if (kind === 'auto-memory') {
+    if (!memoryDir) throw new UsageError('--memory auto-memory 에는 --memory-dir <dir> 가 필요함');
+    const dir = path.resolve(memoryDir);
+    if (fs.existsSync(dir) && !fs.statSync(dir).isDirectory()) throw new UsageError('--memory-dir 가 폴더가 아님');
+    const rule = path.join(dir, 'progress-mon.md');
+    const index = path.join(dir, 'MEMORY.md');
+    return {
+      kind,
+      runtime,
+      dir,
+      steps: [
+        { file: rule, name: '자동 메모리 progress-mon.md', info: inspect(rule, 'progress-mon.md', dir, AUTO_ALT), what: 'rule-file' },
+        { file: index, name: '자동 메모리 MEMORY.md', info: inspect(index, 'MEMORY.md', dir, AUTO_ALT), what: 'index' },
+      ],
+      memory: { kind, path: index },
+    };
+  }
+  if (memoryDir) throw new UsageError('--memory-dir 는 --memory auto-memory 에만 씀');
+  const root = path.resolve(project);
+  if (kind === 'claude-md') {
+    const file = path.join(root, 'CLAUDE.md');
+    return { kind, runtime, steps: [{ file, name: 'CLAUDE.md', info: inspect(file, 'CLAUDE.md', root, CLAUDE_ALT), what: 'line' }], memory: { kind, path: file } };
+  }
+  const t = codexTarget(root);
+  const name = path.basename(t.file);
+  return { kind, runtime, steps: [{ file: t.file, name, info: inspect(t.file, name, root, AGENTS_ALT), what: 'block' }], memory: { kind, path: t.file } };
+}
+
+// 표식 줄 가운데 우리 줄만 지금 판으로 바꾼 글. 줄 끝(CRLF, LF)과 나머지 줄은 그대로. 돌려줌: { text, changed }
+function refreshText(text) {
+  let changed = 0;
+  const out = text.split('\n').map((seg) => {
+    const cr = seg.endsWith('\r') ? '\r' : '';
+    const line = cr ? seg.slice(0, -1) : seg;
+    const want = currentLine(line);
+    if (want === null || want === line) return seg;
+    changed++;
+    return want + cr;
+  });
+  return { text: out.join('\n'), changed };
+}
+
+const RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// 같은 파일을 원자적으로 다시 쓴다: 대상(링크면 실제 파일) 옆 임시 파일에 쓰고 권한을 맞춘 뒤 rename.
+// 쓰기 전에 대상을 다시 보고 하드링크나 특수 파일로 바뀌었으면 쓰지 않는다. 실패하면 임시 파일을 지우고 원본 그대로.
+function rewrite(file, body) {
+  const real = fs.realpathSync(file);
+  const st = fs.statSync(real);
+  if (!st.isFile() || st.nlink > 1) throw changedError(file);
+  // 임시 이름은 난수: Windows 의 wx 는 끊어진 링크를 따라가므로, 미리 맞힐 수 있는 이름이면 링크를 심어 둘 수 있다.
+  const tmp = `${real}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, body, { flag: 'wx', mode: st.mode & 0o777 });
+    fs.chmodSync(tmp, st.mode & 0o7777);
+    for (let i = 0; ; i++) {
+      try {
+        fs.renameSync(tmp, real);
+        return;
+      } catch (e) {
+        if (i >= 4 || !RENAME_CODES.has(e.code)) throw e;
+        pause(50); // Windows 에서 다른 프로세스가 잠깐 쥔 파일
+      }
+    }
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e instanceof UsageError ? e : new UsageError(`${path.basename(file)} 쓰기 실패(${e.code || e.message}). 원본 그대로`);
+  }
+}
+
+// 첫 원본 백업. 이미 있으면 덮지 않는다. 만들지 못하거나 그 자리에 일반 파일이 아닌 것(링크 등)이 있으면 바꾸지 않고 거부.
+function backup(file, buf) {
+  const bak = `${file}.progress-mon.bak`;
+  try {
+    writeNew(bak, buf);
+  } catch (e) {
+    // EEXIST 는 그 자리에 일반 파일(먼저 남긴 첫 원본)이 있을 때만 통과. 링크, 폴더, 그 사이 사라진 이름은 거부
+    const st = e.code === 'EEXIST' ? fs.lstatSync(bak, { throwIfNoEntry: false }) : null;
+    const why = e.code !== 'EEXIST' ? e.code || e.message : !st ? '만든 뒤 이름이 사라짐' : !st.isFile() ? '일반 파일이 아닌 것(링크나 폴더)이 있음' : null;
+    if (why) throw new UsageError(`${path.basename(bak)} 백업을 만들지 못해 규칙 줄을 바꾸지 않음(${why})`);
+  }
+  return bak;
+}
+
+// 표식이 이미 있는 파일. 우리 줄이 지금 판과 다를 때만 그 줄을 바꾸고 백업을 남긴다. BOM 과 나머지 바이트는 그대로.
+// 검사 뒤 UTF-8 이 아니게 바뀐 파일은 바꾸지 않고 경고 줄(U+FFFD 로 바뀐 바이트를 쓰지 않게).
+function refreshStep(s) {
+  const buf = fs.readFileSync(s.file);
+  const bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bom ? buf.subarray(3) : buf);
+  } catch {
+    return `경고: ${s.name} 이 UTF-8 이 아니라 규칙 줄을 바꾸지 않음`;
+  }
+  const r = refreshText(text);
+  if (!r.changed) return `규칙 이미 있음: ${s.name}`;
+  const bak = backup(s.file, buf);
+  rewrite(s.file, Buffer.concat([bom ? buf.subarray(0, 3) : Buffer.alloc(0), Buffer.from(r.text, 'utf8')]));
+  return `규칙 줄 교체(백업 ${bak}): ${s.name}`;
+}
+
+// 표식이 없는 파일에 규칙을 더한다. 돌려줌: 출력 줄.
+function addStep(s, runtime) {
+  const { info } = s;
+  const fresh = !info.exists;
+  const made = fresh ? '새로 만듦, ' : '';
+  if (s.what === 'rule-file') {
+    if (fresh) fs.writeFileSync(s.file, ruleFile(runtime), { flag: 'wx' });
+    else append(s.file, info, [ruleLine(runtime)]);
+    return `규칙 추가: ${s.name} (${fresh ? '새로 만듦' : '1줄'})`;
+  }
+  if (s.what === 'index') {
+    append(s.file, info, [INDEX_LINE]);
+    return `규칙 추가: ${s.name} (${made}색인 1줄)`;
+  }
+  if (s.what === 'line') {
+    append(s.file, info, [ruleLine(runtime)]);
+    return `규칙 추가: ${s.name} (${made}1줄)`;
+  }
+  append(s.file, info, [OMX_OPEN, ruleLine(runtime), OMX_CLOSE]);
+  return `규칙 추가: ${s.name} (${made}3줄)`;
+}
+
+// 계획대로 쓴다. 돌려줌: 출력 줄 목록(규칙 줄, 경고 줄).
+export function applyMemory(plan, project, env = process.env) {
+  if (plan.kind === 'none') return ['규칙 등록 안 함(--memory none)'];
+  if (plan.dir) fs.mkdirSync(plan.dir, { recursive: true });
+  const out = plan.steps.map((s) => (s.info.text.includes(MARKER) ? refreshStep(s) : addStep(s, plan.runtime)));
+  return [...out, ...memoryWarnings(plan.memory, project, env)];
+}

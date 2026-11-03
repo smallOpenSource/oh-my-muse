@@ -23,7 +23,7 @@ description: "소프트웨어 외주 제안요청서(RFP)를 한국 공공/금�
 5. **OPEN 정직 표기**: 미검증 항목(예: 망분리/PIPA 조문 현행 호수·LLM 계약문구·LLM eval binary 임계·SoT 전달방식)은 RFP에 **〈OPEN〉**으로 명시하고 추가 리서치/법무 검토 표시. "정합 OK"/"아마도" 금지.
 6. **verify-before-claim**: 모든 수치·조문·배점은 `references/`로 추적(인용 동반). 완료 전 4-field(① 변경 ② Evidence ③ 검증 ④ Unknown), ⏳=0일 때만 "완료". 커밋/푸시는 사용자 명시 시만.
 7. **쪽번호·인용 의무**: 디자인/문서 SoT(예: 디자인 데크 PDF의 N쪽, 인용키 `<DesignRef(page-section)>`) 인용 시 **page-NNN/쪽번호 직접 기록**. file:LINE/page 없는 "정합 OK" 금지.
-8. **벤더 노출 게이트**: 발송본엔 현황(As-Is)·내부 SoT file:LINE·실제 호스트/포트·내부식별자(보안필터 제품명/내부 테이블 prefix/모델ID)·내부 추적박스·em-dash(`—`→`-`) 비포함. 내부 추적은 `references/`에만.
+8. **벤더 노출 게이트**: 발송본엔 현황(As-Is)·내부 SoT file:LINE·실제 호스트/포트·내부식별자(보안필터 제품명/내부 테이블 prefix/모델ID)·"deep-research"·"lfm"/추적박스·em-dash(`—`→`-`) 비포함. 내부 추적은 `references/`에만.
 
 ## 번들 구성
 
@@ -41,20 +41,26 @@ description: "소프트웨어 외주 제안요청서(RFP)를 한국 공공/금�
 
 RFP 저작은 **저작 lane과 검수 lane을 분리**(자기승인 금지). 권장 순서:
 
-1. **과업내용 추출** — 현 코드/spec → 요구사항. 병렬 서브에이전트(`subagent.spawn`)로 화면·API·데이터·외부연계를 SFR/INR/DAR로 도출 → `references/this-project-scope.md` 채움(file:LINE 동반). 디자인은 PDF/이미지 추출 도구로 `<DesignRef(page-section)>` 형태 인용키 추출.
-2. **구조·범위·배점 합의** — RFP 구조·15유형 범위·평가 정성/정량 배점을 검토자(사용자 또는 별도 검토 서브에이전트)와 합의. broad/risky 결정만. 구조는 [vendor-rfp-structure.md](references/vendor-rfp-structure.md)를 따른다.
-3. **섹션 병렬 작성** — 5+ 섹션이면 서브에이전트 병렬(`subagent.spawn`, 절 담당별 위임), 소규모는 직접 작성. 각 절은 `templates/rfp-skeleton.md`를 채우고 `references/`를 인용.
-4. **미검증 보강** — OPEN 항목(특히 망분리/PIPA/보안성심의/secure-coding)은 **추가 리서치**(웹 검색·딥리서치) 후 SER에 반영. 미보강 시 〈OPEN〉 유지.
-5. **검수(별도 lane)** — 저작과 다른 주체(별도 서브에이전트 또는 독립 검증)로 ① 반증 항목 미혼입 ② currency(2020 진흥법) ③ 인용 추적성 ④ 기밀 누출 0 ⑤ 배점 합(80+20 또는 채택 배점) 검증.
+0. **전문가 작업 방식 조사** — `lfm` 을 두 분야로 부른다(`--no-questions`). ① 과업의 분야(그 종류의 시스템을 잘 만드는 그룹이 어떤 단계, 산출물, 품질 기준, 검수로 일하는지) ② 소프트웨어 외주 발주와 제안 평가(공공 SW 사업 관리 지침을 내는 기관, 조달 기관 등). 결과는 `references/expert-practices.md` 에 내부 추적용으로 둔다. ①의 계획 적용 항목은 기능, 기술, 보안, 비기능 요건과 산출물, 검수 기준 후보가 되고, ②는 평가 기준, 마일스톤, 검수 절차 후보가 된다. 2단계 합의에서 `M-n` 마다 적용, 조정, 제외를 정한다. 벤더 발송본에는 그룹 이름, 출처, `lfm` 이라는 말을 넣지 않는다(노출 게이트). "웹 조사 불가" 면 그 사실을 `references/expert-practices.md` 에 적고 진행한다.
+1. **과업내용 추출** — 현 코드/spec → 요구사항. `research`(OMC 5 에서 삭제된 `deep-dive` 의 대체) 또는 agent `feature-dev:code-explorer` 로 화면·API·데이터·외부연계를 SFR/INR/DAR로 도출 → `references/this-project-scope.md` 채움(file:LINE 동반). 디자인은 PDF/이미지 추출 도구로 `<DesignRef(page-section)>` 형태 인용키 추출.
+2. **구조·범위·배점 합의** — `ralplan --deliberate`로 RFP 구조·15유형 범위·평가 정성/정량 배점을 Planner→Architect→Critic 합의(Planner는 SoT word-for-word 인용 의무). broad/risky 결정만. `references/expert-practices.md` 의 `M-n` 마다 판정(적용, 조정, 제외)과 이유를 합의에 포함한다.
+3. **섹션 병렬 작성** — 5+ 섹션이면 `team`(워커별 절 담당), 소규모는 agent `oh-my-claudecode:writer`. 각 절은 `templates/rfp-skeleton.md`를 채우고 `references/`를 인용.
+4. **미검증 보강** — OPEN 항목(특히 망분리/PIPA/보안성심의/secure-coding)은 `autoresearch`/`deep-research` 또는 agent `document-specialist`로 **추가 리서치 후** SER에 반영. 미보강 시 〈OPEN〉 유지.
+5. **검수(별도 lane)** — agent `oh-my-claudecode:critic` 또는 `verify`로 ① 반증 항목 미혼입 ② currency(2020 진흥법) ③ 인용 추적성 ④ 기밀 누출 0 ⑤ 배점 합(80+20 또는 채택 배점) 검증.
+
+Muse 환경에서는 위 원본 도구(`lfm`·`research`/`deep-dive`·`feature-dev:code-explorer`·`ralplan`·`team`·`oh-my-claudecode:writer`·`autoresearch`·`deep-research`·`document-specialist`)를 서브에이전트 병렬 검토와 웹 검색·딥리서치 스킬로 대체한다. 저작 lane과 검수 lane 분리는 유지한다.
 6. **산출물 변환** — 아래 §산출물.
 
 | 작업 | 권장 도구 |
 |---|---|
-| 과업내용 추출(코드→요구) | `subagent.spawn` 코드 탐색 / PDF·이미지 추출 도구 |
-| 구조·배점 합의 | 사용자 또는 검토 서브에이전트와 합의 |
-| 섹션 병렬 저작 | `subagent.spawn` 병렬 (절 담당별) |
-| OPEN 추가 리서치 | 웹 검색·딥리서치 스킬 |
-| 검수(반증·인용·기밀) | 별도 서브에이전트 (저작 lane과 분리) |
+| 전문가 작업 방식(과업 분야, 외주 발주) | `lfm` |
+| 과업내용 추출(코드→요구) | `research`(구 `deep-dive`) / `feature-dev:code-explorer` / PDF·이미지 추출 도구 |
+| 구조·배점 합의 | `ralplan --deliberate` |
+| 섹션 병렬 저작 | `team` / `oh-my-claudecode:writer` |
+| OPEN 추가 리서치 | `autoresearch` / `deep-research` / `document-specialist` |
+| 검수(반증·인용·기밀) | `oh-my-claudecode:critic` / `verify` / `pr-review-toolkit:comment-analyzer` |
+
+Muse 환경 대응: 위 원본 도구는 서브에이전트 병렬 검토와 웹 검색·딥리서치 스킬로 대체한다(아래 Operating Rules 참조).
 | 산출물(.docx) | 번들 `scripts/md2docx.py` · (.xlsx/.pptx는 python-openpyxl/python-pptx) |
 
 ## 산출물 변환 (md → docx)
@@ -62,7 +68,16 @@ RFP 저작은 **저작 lane과 검수 lane을 분리**(자기승인 금지). 권
 번들 **`scripts/md2docx.py`**(python-docx) 사용. 실행: `python scripts/md2docx.py <in.md> <out.docx> [폰트]`. 처리: 한국어 폰트(`w:rFonts` ascii/hAnsi/**eastAsia**/cs — eastAsia 누락 시 한글 깨짐)·헤딩·타이틀 20pt·blockquote 8pt italic·불릿·**굵게**·**고정폭 표**·footer **페이지번호**(PAGE 필드).
 
 - ★**표 컬럼폭 함정**: 고정 레이아웃(`w:tblLayout type=fixed`)에서 Word는 `cell.width`가 아니라 **`w:tblGrid/w:gridCol@w:w`(twips=inch×1440)**로 렌더 → gridCol에 직접 set해야 비균등폭(미설정 시 균등폭으로 보임). 맨왼쪽 컬럼은 셀 텍스트 길이로 fit-content(CJK ~0.14"/ascii ~0.08"), 나머지 균등(합 6.5").
-- xlsx 평가배점표·pptx 요약은 python-openpyxl/python-pptx 직접.
+- xlsx 평가배점표·pptx 요약은 python-openpyxl/python-pptx 직접. Anthropic docx/xlsx/pptx/pdf Agent Skill은 API/claude.ai 런타임에서만 동작.
+
+## 함정 (반드시 확인)
+- **반증 혼입**: ±10점 가감·구법 제20조③·`SIR` — 그럴듯해서 새어들기 쉬움. 검수 lane에서 grep.
+- **stale citation**: "spec 정합"식 빈말 금지 — file:LINE/`<DesignRef(page-section)>`/조문번호 직접 인용.
+- **source-strength 혼동**: 한국 규제·NIST=primary, 국제 계약절=template+법무 secondary(한국법 검토 전 mandate처럼 단정 금지). IP-assignment default는 반대.
+- **OPEN을 채운 척**: 미검증 항목을 합성으로 메우지 말 것. 〈OPEN〉 + 추가 리서치 경로 표기.
+- **배포 환경 혼동**: 운영 타깃 구성(웹서버/WAS/HTTP 버전 등)을 ECR로, dev simple-run divergence는 참고로만(this-project §운영/dev 구분).
+- **벤더 문서 내부누출**: 요건 발의형 벤더 RFP에 내부 SoT `file:LINE`·실제 호스트/포트·내부식별자(보안필터 제품명·내부 테이블 prefix·모델ID)·"deep-research"·"lfm"/추적박스 **절대 비포함**. 내부 추적은 `references/`에만(검수 lane grep).
+- **md→docx 표 균등폭**: §산출물 gridCol 함정 — `cell.width`만 set 시 표가 균등폭으로 렌더. `w:gridCol@w:w` 직접 set.
 
 ## Output Contract
 
@@ -70,13 +85,6 @@ RFP 저작은 **저작 lane과 검수 lane을 분리**(자기승인 금지). 권
 
 ## Operating Rules
 
-- **함정 — 반증 혼입**: ±10점 가감·구법 제20조③·`SIR` — 그럴듯해서 새어들기 쉬움. 검수 lane에서 grep.
-- **함정 — stale citation**: "spec 정합"식 빈말 금지 — file:LINE/`<DesignRef(page-section)>`/조문번호 직접 인용.
-- **함정 — source-strength 혼동**: 한국 규제·NIST=primary, 국제 계약절=template+법무 secondary(한국법 검토 전 mandate처럼 단정 금지). IP-assignment default는 반대.
-- **함정 — OPEN을 채운 척**: 미검증 항목을 합성으로 메우지 말 것. 〈OPEN〉 + 추가 리서치 경로 표기.
-- **함정 — 배포 환경 혼동**: 운영 타깃 구성(웹서버/WAS/HTTP 버전 등)을 ECR로, dev simple-run divergence는 참고로만(this-project §운영/dev 구분).
-- **함정 — 벤더 문서 내부누출**: 요건 발의형 벤더 RFP에 내부 SoT `file:LINE`·실제 호스트/포트·내부식별자(보안필터 제품명·내부 테이블 prefix·모델ID)·내부 추적박스 **절대 비포함**. 내부 추적은 `references/`에만(검수 lane grep).
-- **함정 — md→docx 표 균등폭**: §산출물 gridCol 함정 — `cell.width`만 set 시 표가 균등폭으로 렌더. `w:gridCol@w:w` 직접 set.
 - 원본의 `deep-dive`·`feature-dev:code-explorer`·`oh-my-claudecode:writer/critic`·`ralplan`·`team`·`autoresearch`·`deep-research` 등 Claude Code 생태계 에이전트/CLI는 이 환경에서 `subagent.spawn`(병렬 서브에이전트)과 웹 검색·딥리서치 스킬로 대체한다. 저작 lane과 검수 lane 분리는 반드시 유지한다.
 - MCP/커넥터 설치 안내는 먼저 `muse.skill_search`로 관련 커넥터·스킬이 있는지 확인하고, 없으면 해당 안내를 유지한다.
 - 참고: [references/research-provenance.md](references/research-provenance.md)는 출처·confidence·반증·caveat·OPEN의 추적성 백본이다. 인용은 이 파일을 근거로 한다.

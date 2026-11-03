@@ -10,12 +10,16 @@
  * none): the whole block is the secret, not just the BEGIN line. The matched text itself is never
  * printed, so the report cannot become the leak. The patterns cover common key and token
  * formats, private key blocks (PGP too), secret assignments (quoted, or unquoted with letters
- * and digits), passwords (quoted, with a symbol, alone on a config or env-file line, or after a
- * Dockerfile `ENV KEY value`), secrets given as command-line flags, curl's user and password flag,
- * hex keys, Basic and Bearer credentials, credentials in URLs and
+ * and digits), passwords (quoted, with a symbol, alone on a config or env-file line, a KEY=value
+ * word after a space, a quote, `(` or `=` as in `env`, `docker -e`, `--from-literal=`, or after a Dockerfile
+ * `ENV KEY value`; the shell's own PWD or OLDPWD holding a path is no password),
+ * secrets given as command-line flags, curl's user and password flag,
+ * hex keys, Basic and Bearer credentials, credentials in URLs, a .netrc password (on its machine line or on a line
+ * of its own), a .pgpass line, docker's config.json "auth" (base64 of user:password) and
  * long high-entropy strings (a lockfile's sha512- integrity hash and a Go or Terraform h1: hash
  * aside); they do not prove a payload clean. A Docker secret file's path after a *_FILE key is
- * not read as the password it points to. Every repeat and lookahead is bounded (a run longer than
+ * not read as the password it points to, and a value masked as a whole `[REDACTED]` word (the mask
+ * SKILL.md asks for) is no value, so a masked payload scans clean; a mask glued to the rest of a value is not. Every repeat and lookahead is bounded (a run longer than
  * 65536 characters is read in pieces) or anchored, so a long line takes linear time and cannot
  * overflow the regex stack.
  */
@@ -25,6 +29,9 @@ import { fileURLToPath } from "node:url";
 const SECRET_KEY = String.raw`(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|access[_-]?key|credential|비밀번호|패스워드)[\w-]{0,64}["']?\s*[:=]\s*`;
 // `pass` and `passphrase` count only as a word of their own (DB_PASS, "pass"), not inside bypass.
 const PASS_WORD = String.raw`(?:passw(?:or)?d|pwd|passcode|(?<![a-z])pass(?:phrase)?(?![a-z]))`;
+// An env-style key that holds a password word, up to its `=`, and a value that is no reference or whole placeholder
+// (`$X`, `<your-password>`, `{{ x }}`, `%(x)s`, `%X%`). A value that only starts with `<` or `{` is still read.
+const ENV_KEY = String.raw`[A-Za-z0-9_]{0,64}(?:passw(?:or)?d|pwd|passcode)[A-Za-z0-9_]{0,64}=(?!-|\$|<[^>\s]{1,64}>|\{\{|%\(|%[A-Za-z_][A-Za-z0-9_]{0,64}%)`;
 const PASSWORD_KEY = String.raw`(?:${PASS_WORD}|비밀번호|패스워드)[\w-]{0,64}["']?\s*[:=]\s*`;
 // An unquoted value that is not code: none of the characters an expression or a reference
 // holds, and at least one symbol (an identifier has none).
@@ -54,7 +61,9 @@ export const PATTERNS = [
   ["assigned-secret", new RegExp(SECRET_KEY + String.raw`["'](?:[^"'\s]{12,256}|(?=[^"'\s]{0,10}\d)[^"'\s]{8,11})["']`, "i")],
   ["assigned-secret-bare", new RegExp(SECRET_KEY + String.raw`(?=[^\s"']{0,256}\d)(?=[^\s"']{0,256}[A-Za-z])[^\s"'(\[{]{12,256}`, "i")],
   ["assigned-password", new RegExp(PASSWORD_KEY + String.raw`(?:["'][^"'\s]{6,256}["']|(?=${BARE}{0,256}[^\w\s;,"'().\[\]{}$<>])${BARE}{6,256})`, "i")],
-  ["env-password", /^[+\- ]?\s*(?:export\s+)?[A-Za-z0-9_]{0,64}(?:passw(?:or)?d|pwd|passcode)[A-Za-z0-9_]{0,64}=[^\s$"'][^\s"']{5,256}/i],
+  // at the head of a line, or as a word after a space, a quote, `(` or `=` (env, docker -e, --from-literal=, a subshell),
+  // its value ending the word
+  ["env-password", new RegExp(String.raw`^[+\- ]?\s*(?:export\s+)?${ENV_KEY}[^\s"']{6,256}|(?<=[\s"'(=])${ENV_KEY}[^\s"',;()\[\]{}]{6,256}(?=[\s"']|$)`, "i")],
   // a password alone on a config line: YAML, compose lists, .properties, Dockerfile ENV, diff marks
   ["config-password", new RegExp(String.raw`^[+\- ]?\s*(?:-\s+|export\s+|ENV\s+)?[\w.-]{0,64}${PASS_WORD}[\w.-]{0,64}["']?\s*[:=]\s*["']?(?![-$<{%])[^\s"',;()\[\]{}]{6,256}["']?\s*(?:#.*)?$`, "i")],
   // a Dockerfile's legacy `ENV KEY value` form, the value alone after the space
@@ -66,7 +75,21 @@ export const PATTERNS = [
   // that would let admin:admin through.
   ["curl-user", /(?<!\S)(?:-u\s*|--user(?:\s+|=))(?!(["']?)\d{1,10}:\d{1,10}\1(?=["'`\s;|&)]|$))(?!["']?\+%|\))[^\s:=]{1,256}:(?!\/)\S{3,256}/],
   ["assigned-hex", /(?:key|auth|token|secret)[\w-]{0,64}["']?\s*[:=]\s*["']?[0-9a-f]{32,65536}(?![0-9a-z])/i],
+  // .netrc: `machine <host> ... password <value>` on one line, or a `password <value>` line of its own (the file's
+  // other layout, one token pair a line); a value that is a reference or a placeholder is none
+  ["netrc-password", /^[+\- ]?\s*(?:(?:machine\s+\S{1,256}|default)(?:\s+\S{1,256}){0,16}?\s+password\s+(?![$<{%])\S|password\s+(?![$<{%])\S{1,256}\s*$)/],
+  // .pgpass: host:port:database:user:password, the port a number or *, no empty field. The host is not digits alone
+  // and the password holds no colon but an escaped one (\:), so a MAC of digits or a time (12:30:45:00) is no hit.
+  ["pgpass-line", /^[+\- ]?(?=[^\s:#]*[^\d\s:#])[^\s:#+\-][^\s:#]{0,255}:(?:\d{1,5}|\*):[^\s:]{1,256}:[^\s:]{1,256}:(?!\*?$)(?:\\.|[^\s:\\]){1,256}$/],
+  // docker's config.json: "auth" holds base64 of user:password (checked by decoding it, below)
+  ["docker-auth", /"auth"\s*:\s*"[A-Za-z0-9+/]{4,65536}={0,2}"/],
 ];
+
+// A kind whose pattern alone reads too wide: the line counts only when this holds as well.
+const DOCKER_AUTH = /"auth"\s*:\s*"([A-Za-z0-9+/]{4,65536}={0,2})"/;
+const CONFIRM = {
+  "docker-auth": (line) => Buffer.from(DOCKER_AUTH.exec(line)[1], "base64").toString("latin1").includes(":"),
+};
 
 // Long runs of base64-like characters whose Shannon entropy is that of random data, as
 // lineage's redaction measures them (32 characters or more, 4.5 bits per character or more).
@@ -94,10 +117,18 @@ const highEntropy = (line) => [...line.matchAll(LONG_RUN)].some((m) => !publicHa
 // not that password: the kinds that read a value after a key name see a `-` there instead. The
 // other kinds still read the line as it is, so a key's own format shows wherever it sits.
 const SECRET_FILE_PATH = /(?<![\w.-])([\w.-]{0,128}_FILE["']?(?:[ \t]*[:=][ \t]*|[ \t]+)["']?)\/[\w.@-]{1,128}(?:\/[\w.@-]{1,128}){0,32}(?=["']?(?:[\s,;#]|$))/gi;
+// The shell's own working folder (PWD, OLDPWD, as `env`, `declare -x` or a JSON dump shows it) holding a plain path:
+// no password, though PWD reads like one. A key that only ends in PWD (MYSQL_PWD) and a value that is no plain path
+// stay. Taken out before the keyed patterns read the line, as lineage does.
+const SHELL_DIR = /(?<=^[+\- ]?|[\s"'$])((?:OLD)?PWD["']?[ \t]*[:=][ \t]*["']?)(?:~|\/|[A-Za-z]:[\\/])[^\s"'!#$%&*;|<>()[\]{}`^?=]{0,4096}(?=["']?(?:[\s,]|$))/g;
 const KEYED = new Set(["assigned-secret", "assigned-secret-bare", "assigned-password", "env-password", "config-password",
   "dockerfile-env-password"]);
 
 const KEY_END = new RegExp(`-----END ${PRIVATE_KEY}`);
+// The mask SKILL.md asks for, as a word of its own. One glued to the rest of a value is no mask: what is left is read.
+const WHOLE_MASK = /(?<!\w)\[REDACTED\](?!\w)/g;
+
+const caught = (kind, re, plain, keyed) => re.test(KEYED.has(kind) ? keyed : plain) && (!CONFIRM[kind] || CONFIRM[kind](plain));
 
 // Each line's secret-like kinds, once per kind and line. A private key closes at the first END
 // marker at or after its line: the END lines are found once and walked with the lines, so many
@@ -109,12 +140,13 @@ export function scan(text) {
   let next = 0;
   lines.forEach((line, i) => {
     while (next < ends.length && ends[next] < i + 1) next += 1;
-    const keyed = line.replace(SECRET_FILE_PATH, "$1-");
+    const plain = line.replace(WHOLE_MASK, "-");
+    const keyed = plain.replace(SECRET_FILE_PATH, "$1-").replace(SHELL_DIR, "$1-");
     for (const [kind, re] of PATTERNS) {
-      if (!re.test(KEYED.has(kind) ? keyed : line)) continue;
+      if (!caught(kind, re, plain, keyed)) continue;
       hits.push(kind === "private-key" ? { line: i + 1, kind, end: ends[next] ?? null } : { line: i + 1, kind });
     }
-    if (highEntropy(line)) hits.push({ line: i + 1, kind: "high-entropy" });
+    if (highEntropy(plain)) hits.push({ line: i + 1, kind: "high-entropy" });
   });
   return { count: hits.length, hits };
 }

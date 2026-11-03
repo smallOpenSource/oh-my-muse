@@ -146,7 +146,7 @@ run의 `a:latin`·`a:ea`·`a:cs` **세 슬롯에 같은 typeface를 넣어야 �
 ### 폰트 선택 체인 (하드코딩 금지)
 ```
 --font <이름> → BANKER_PPTX_FONT → meta.font →
-Noto Sans CJK KR → Malgun Gothic → Apple SD Gothic Neo → NanumGothic → 시스템 한국어 sans
+Noto Sans CJK KR → Noto Sans KR → Malgun Gothic → Apple SD Gothic Neo → AppleGothic → NanumGothic → 시스템 한국어 sans
 ```
 빌더는 **실제로 파일이 존재하는 이름**을 위에서부터 고르고, 고른 이름과 절대경로를 항상 보고한다(stdout 마지막 줄 JSON의 `fontFile`). 명시한 이름이 해석되지 않으면 `FONT_NOT_FOUND` 경고를 남기고 다음으로 내려간다(조용히 바꾸지 않는다). 검증기는 그 경로를 **믿지 않고 대조**한다(폰트 `name` 테이블 패밀리 vs pptx의 `a:latin`) — 경로에 적힌 폰트와 실제 폰트가 다르면 이름 재해석으로 내려간다.
 
@@ -172,7 +172,7 @@ Noto Sans CJK KR → Malgun Gothic → Apple SD Gothic Neo → NanumGothic → �
 exit 2는 사용자가 그대로 따라 할 수 있는 안내라서 stdout으로 나간다. 나머지 오류는 stderr다.
 
 - **node가 베이스라인이다.** `verify_a4p.mjs`는 node stdlib만 쓴다. python으로 빌드했더라도 그 결과를 판정하려면 `verify_a4p.mjs`를 돌려야 하고, 검증 없는 생성은 이 스킬의 가치가 아니다. 스크립트는 **의존성을 자동 설치하지 않는다.** 런타임 준비는 `vertical-pptx-setup` 스킬이 담당한다.
-- 일회성 스크래치 설치: `npm i --no-save --no-audit --no-fund pptxgenjs@4`, `python -m pip install --target <dir> python-pptx fonttools` (`PYTHONPATH`/`NODE_PATH`에 경로 추가).
+- 일회성 스크래치 설치: 네트워크가 필요한 설치다. 먼저 `vertical-pptx-setup`의 네트워크 확인을 돌리고, 닿지 않으면 설치하지 않고 "오프라인이라 설치하지 않음(필요한 것: pptxgenjs 또는 python-pptx)"으로 알린다. 스크래치 폴더(`S=$(mktemp -d)`, 프로젝트 트리와 그 `.npmrc` 밖)에서 `(cd "$S" && npm i --no-save --no-audit --no-fund pptxgenjs@4)`하고 `NODE_PATH=$S/node_modules`를 찍고, `(cd ~ && python -m pip install --target <절대 경로> python-pptx fonttools)`로 받는다(홈에서: 지금 폴더의 모듈을 먼저 불러오지 않게). `--target`으로 받았으면 그 경로를 `PYTHONPATH`에, npm 쪽은 찍힌 `NODE_PATH`에 넣어 부른다. 다 쓴 스크래치 폴더는 `rm -rf "$S"`로 지운다. npm을 지금 폴더에서 돌리면 그 폴더에 `node_modules`를 만들고 그 폴더의 `.npmrc`가 정한 레지스트리와 토큰을 따르므로 스크래치 폴더에서 돌린다.
 
 ### 의존성 (자동 설치하지 않는다)
 
@@ -200,7 +200,6 @@ exit 2는 사용자가 그대로 따라 할 수 있는 안내라서 stdout으로
 10. 각 파일의 전체 플래그는 `--help`로 확인한다(`build_a4p.js --help` · `build_a4p.py --help` · `verify_a4p.mjs --help`).
 11. 이 환경의 한계: LibreOffice 시각 렌더 검증은 `vertical-pptx-setup`으로 soffice를 설치했을 때만 가능하다. 없으면 구조·좌표·메트릭 검증으로 대체하고 Unknown으로 표기한다.
 12. **`a:ea` 누락.** python-pptx에서 가장 흔한 한글 깨짐 원인이다 (§한글 3슬롯).
-
 ## 참고
 
 - `verify_a4p.mjs --json`이 기계 판독용 리포트를 낸다. finding마다 `code`·`slide`·`shape`·`severity`·`status`·`detail`이 붙는다.

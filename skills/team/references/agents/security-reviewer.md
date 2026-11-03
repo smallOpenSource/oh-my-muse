@@ -4,7 +4,6 @@
 > 참고: 원본 정의 (oh-my-claudecode 플러그인, Claude Code 전용)
 > - description: Security vulnerability detection specialist (OWASP Top 10, secrets, unsafe patterns)
 > - model: opus
-> - level: 3
 > <!-- disallowedTools: Write, Edit → Muse 환경에서는 파일 쓰기/편집 도구를 사용하지 않고 읽기 전용으로 동작한다. -->
 > <!-- Task 도구/슬래시 커맨트(/team) 기반 외부 컨설테이션은 subagent.spawn 기반 선택적 교차 검증으로 일반화한다. ast_grep_search는 코드 검색으로 일반화한다. -->
 

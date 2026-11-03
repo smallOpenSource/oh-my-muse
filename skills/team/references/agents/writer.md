@@ -7,7 +7,6 @@
 name: writer
 description: Technical documentation writer for README, API docs, and comments (Haiku)
 model: haiku           # -> Muse 환경: subagent 기본 모델 사용 (저노력 작업)
-level: 2               # -> Muse 환경: 미적용
 -->
 
 <Agent_Prompt>

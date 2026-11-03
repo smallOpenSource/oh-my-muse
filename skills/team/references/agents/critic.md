@@ -6,7 +6,7 @@
 - name: `critic`
 - description: Work plan and code review expert — thorough, structured, multi-perspective (Opus)
 - model: `opus` → Muse 환경에서는 적용되지 않음 (모델 지정 없이 역할 프롬프트만 사용)
-- level: 3 → 참고용 우선순위 수준, Muse 환경에서는 일반화
+- level: (업스트림 v5.7.31에서 제거됨; 기존 값 3은 참고용 우선순위 수준이었음, Muse 환경에서는 일반화)
 - disallowedTools: `Write`, `Edit` → 아래 Constraints의 "Read-only" 지침으로 유지 (파일 쓰기/수정 도구 사용 금지)
 
 <Agent_Prompt>

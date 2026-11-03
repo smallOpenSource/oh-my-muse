@@ -93,7 +93,7 @@ for t in git python3 node; do command -v $t >/dev/null && echo "$t: $($t --versi
 
 ## Operating Rules
 
-- Claude Code 전용 점검 항목(원본 Step 1 플러그인 버전, Step 2~3 레거시 hooks, Step 4 CLAUDE.md OMC 마커, Step 6 플러그인 캐시, Step 7 curl 설치 잔재)은 이 환경에 해당 개념이 없으므로 점검하지 않는다. 요구받으면 "이 환경에서는 해당 없음"으로 명시한다.
+- Claude Code 전용 점검 항목(원본 Step 1 플러그인 버전, Step 2~3 레거시 hooks, Step 4 CLAUDE.md OMC 마커, Step 6 플러그인 캐시, Step 7 curl 설치 잔재)은 이 환경에 해당 개념이 없으므로 점검하지 않는다. 요구받으면 "이 환경에서는 해당 없음"으로 명시한다. v5.7.31의 CLAUDE.md `claudeMdEnabled` 옵트아웃 프로브도 같은 사유로 해당 없음 (원본 Step 4·Fix 변경 미반영).
 - 파괴적 수정(파일 삭제, 상태 초기화)은 확인 없이 실행하지 않는다. 파일 삭제 시 `trash` 도구 사용을 우선한다.
 - `npm view` 같은 네트워크 조회는 필요시에만 수행하고, 실패하면 "(조회 불가)"로 표기한다.
 - self-improve 상태 파일을 고칠 때는 JSON 구조를 보존하고, 백업(`agent-settings.json.bak`)을 먼저 만든다.

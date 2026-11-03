@@ -27,7 +27,7 @@ UI 목업·화면 디자인·와이어프레임·대시보드·다이어그램�
 
 ```bash
 ls -lh <pdf-path>
-python3 -c "import fitz; d=fitz.open('<pdf-path>'); print('pages=', d.page_count)"
+(cd ~ && python3 -c "import fitz; d=fitz.open('<absolute-pdf-path>'); print('pages=', d.page_count)")   # from home: -c, -m and a stdin script import from the current folder first
 ```
 
 ### 2. 출력 디렉터리 정하기
@@ -41,7 +41,7 @@ python3 -c "import fitz; d=fitz.open('<pdf-path>'); print('pages=', d.page_count
 PyMuPDF가 가장 신뢰할 단일 의존성 경로(Poppler·ImageMagick 불필요).
 
 ```bash
-python3 - <<'PY'
+(cd ~ && python3 - <<'PY'
 import fitz, os
 SRC = "<absolute-pdf-path>"
 OUT = "<absolute-output-dir>"
@@ -55,9 +55,12 @@ for i, page in enumerate(doc, start=1):
     pix.save(f"{OUT}/page-{i:03d}.png")
     print(f"[{i}/{doc.page_count}] page-{i:03d}.png {pix.width}x{pix.height}")
 PY
+)
 ```
 
 없으면 설치: `python3 -m pip install --user pymupdf`
+
+오프라인(네트워크 없음): 설치하지 않고 4절 폴백 도구(`pdftoppm`, ImageMagick)를 찾고 "오프라인이라 설치하지 않음(필요한 것: pymupdf)"이라 말한다. pip은 기본 15초 타임아웃으로 5회 재시도 후 실패한다.
 
 ### 4. 폴백 툴체인
 
@@ -100,9 +103,11 @@ long edge ≈ 2400px 기대.
 - **하이브리드 파이프라인(선택)**: 비주얼 + 검색 가능 텍스트가 함께 필요하면 markdown도 추출한다:
 
 ```bash
-python3 -m pip install --user pymupdf4llm
-python3 -c "import pymupdf4llm; print(pymupdf4llm.to_markdown('<pdf>'))" > <OUT>/text.md
+(cd ~ && python3 -m pip install --user pymupdf4llm)
+(cd ~ && python3 -c "import pymupdf4llm; print(pymupdf4llm.to_markdown('<absolute-pdf-path>'))") > <OUT>/text.md
 ```
+
+설치에도 네트워크가 필요하므로 오프라인이면 마크다운 companion을 빼고 그렇게 말한다.
 
 `.md`에서 라벨을 grep하고 PNG와 교차 참조한다.
 
